@@ -33,6 +33,25 @@ func main() {
 }
 ```
 
+- Using Pytorch
+```python
+import torch
+
+def main():
+    # Example of how to create a tensor and perform an operation
+    x_data = torch.tensor([1.0, 2.0, 3.0])
+    y_data = torch.tensor([4.0, 5.0, 6.0])
+
+    # Perform element-wise multiplication
+    result = x_data * y_data
+
+    print("Result of multiplication:", result)
+
+if __name__ == "__main__":
+    main()
+```
+
+
 ### TODO 
 1) Impelement Gonum for matrix multiplication
 2) Impelemnt 2D and 3D vectors
