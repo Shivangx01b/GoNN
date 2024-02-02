@@ -1,3 +1,12 @@
+<h1 align="center">
+  <br>
+  <a href=""><img src="https://github.com/Shivangx01b/LfiMe/blob/main/static/logo.png" alt="" width="200px;"></a>
+  <br>
+  <img src="https://img.shields.io/github/languages/top/Shivangx01b/GoNN?style=flat-square">
+  <a href="https://goreportcard.com/report/github.com/Shivangx01b/GoNN"><img src="https://goreportcard.com/badge/github.com/Shivangx01b/GoNN"></a>
+  <a href="https://twitter.com/intent/follow?screen_name=shivangx01b"><img src="https://img.shields.io/twitter/follow/shivangx01b?style=flat-square"></a>
+</h1>
+
 # GoNN
 A go based neural network framework
 
