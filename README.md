@@ -56,3 +56,4 @@ if __name__ == "__main__":
 1) Impelement Gonum for matrix multiplication
 2) Impelemnt 2D and 3D vectors
 3) Better Backwards capability (looks like shit for now)
+4) Test MNIST dataset
