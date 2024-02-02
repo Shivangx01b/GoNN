@@ -3,7 +3,7 @@ A go based neural network framework
 
 ## What is GONN ?
 
-GoNN is Go Lang based Neural Network for deep learning (work in progress!). This project does not compete with any exsisting neural network library which is world famouse like Pytroch, Tensorflow etc; but still it's a deep learning framework in future (I feel so ?)
+GoNN is Go Lang based Neural Network for deep learning (work in progress!). This project does not compete with any exsisting neural network library which is world famouse like Pytroch, Tensorflow etc; but still it's a deep learning framework (I feel so ?)
 
 ## Example usage
 
