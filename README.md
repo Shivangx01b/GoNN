@@ -7,6 +7,7 @@ GoNN is Go Lang based Neural Network for deep learning (work in progress!). This
 
 ## Example usage
 
+- Using GoNN
 ```go
 package main
 
