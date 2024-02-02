@@ -1,6 +1,6 @@
 <h1 align="center">
   <br>
-  <a href=""><img src="https://github.com/Shivangx01b/LfiMe/blob/main/static/logo.png" alt="" width="200px;"></a>
+  <a href=""><img src="https://github.com/Shivangx01b/GoNN/blob/main/static/logo.png" alt="" width="200px;"></a>
   <br>
   <img src="https://img.shields.io/github/languages/top/Shivangx01b/GoNN?style=flat-square">
   <a href="https://goreportcard.com/report/github.com/Shivangx01b/GoNN"><img src="https://goreportcard.com/badge/github.com/Shivangx01b/GoNN"></a>
