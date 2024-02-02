@@ -1,5 +1,5 @@
 # GoNN
-A go based neural network for basic stuffs
+A go based neural network framework
 
 ## What is GONN ?
 
