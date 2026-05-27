@@ -1,114 +1,64 @@
+// GoNN entry point. Demonstrates the core Tensor API with autograd.
+// For richer examples see examples/.
 package main
 
 import (
 	"fmt"
-	"gonn/tensor"
 
-	"gonum.org/v1/gonum/mat"
+	"gonn/tensor"
 )
 
 func main() {
-	test1D()
-	test2D()
-	test3D()
-	testAdd1D()
-	testAdd2D()
-	testAdd3D()
+	fmt.Println("GoNN — Go neural-network framework")
+	fmt.Println("==================================")
+	fmt.Println()
+
+	demoBasicOps()
+	demoAutograd()
+	demoMatmul()
+	demoActivations()
 }
 
-func test1D() {
-	// Initialize 1D tensors
-	xData := mat.NewVecDense(3, []float64{1.0, 2.0, 3.0})
-	yData := mat.NewVecDense(3, []float64{4.0, 5.0, 6.0})
-
-	// Perform element-wise multiplication
-	ctx := &tensor.Context{}
-	mulOp := &tensor.Mul{}
-	result := mulOp.Forward(ctx, xData, yData).(*mat.VecDense) // Assuming Forward returns *mat.VecDense for 1D
-
-	fmt.Println("Result of 1D multiplication:", result.RawVector().Data)
+func demoBasicOps() {
+	fmt.Println("[1] Basic ops")
+	x := tensor.New([]float64{1, 2, 3, 4, 5, 6}, 2, 3)
+	y := tensor.New([]float64{7, 8, 9, 10, 11, 12}, 2, 3)
+	fmt.Printf("  x = %v\n", x)
+	fmt.Printf("  y = %v\n", y)
+	fmt.Printf("  x + y = %v\n", x.Add(y))
+	fmt.Printf("  x * y = %v\n", x.Mul(y))
+	fmt.Printf("  sum(x)= %v\n", x.Sum())
+	fmt.Println()
 }
 
-func test2D() {
-	// Initialize 2D tensors
-	xData := mat.NewDense(2, 3, []float64{1.0, 2.0, 3.0, 4.0, 5.0, 6.0})
-	yData := mat.NewDense(2, 3, []float64{7.0, 8.0, 9.0, 10.0, 11.0, 12.0})
-
-	// Perform element-wise multiplication
-	ctx := &tensor.Context{}
-	mulOp := &tensor.Mul{}
-	result := mulOp.Forward(ctx, xData, yData).(*mat.Dense) // Assuming Forward returns *mat.Dense for 2D
-
-	fmt.Printf("Result of 2D multiplication:\n%v\n", mat.Formatted(result))
+func demoAutograd() {
+	fmt.Println("[2] Autograd: d/dx [sum((Wx)^2)] for x = [1,2,3]")
+	x := tensor.New([]float64{1, 2, 3}, 3, 1).SetRequiresGrad(true)
+	W := tensor.New([]float64{2, -1, 0.5}, 1, 3).SetRequiresGrad(true)
+	y := W.MatMul(x).Square().Sum()
+	y.Backward()
+	fmt.Printf("  y = %v\n", y)
+	fmt.Printf("  dy/dx = %v\n", x.Grad)
+	fmt.Printf("  dy/dW = %v\n", W.Grad)
+	fmt.Println()
 }
 
-func test3D() {
-	// Initialize 3D tensors as slices of 2D tensors
-	xData := []*mat.Dense{
-		mat.NewDense(2, 2, []float64{1.0, 2.0, 3.0, 4.0}),
-		mat.NewDense(2, 2, []float64{5.0, 6.0, 7.0, 8.0}),
-	}
-	yData := []*mat.Dense{
-		mat.NewDense(2, 2, []float64{9.0, 10.0, 11.0, 12.0}),
-		mat.NewDense(2, 2, []float64{13.0, 14.0, 15.0, 16.0}),
-	}
-
-	// Perform element-wise multiplication
-	ctx := &tensor.Context{}
-	mulOp := &tensor.Mul{}
-	result := mulOp.Forward(ctx, xData, yData).([]*mat.Dense) // Assuming Forward returns []*mat.Dense for 3D
-
-	fmt.Println("Result of 3D multiplication:")
-	for i, m := range result {
-		fmt.Printf("Layer %d:\n%v\n", i+1, mat.Formatted(m))
-	}
+func demoMatmul() {
+	fmt.Println("[3] MatMul")
+	A := tensor.New([]float64{1, 2, 3, 4}, 2, 2)
+	B := tensor.New([]float64{5, 6, 7, 8}, 2, 2)
+	fmt.Printf("  A @ B = %v\n", A.MatMul(B))
+	fmt.Println()
 }
 
-func testAdd1D() {
-	// Initialize 1D tensors
-	xData := mat.NewVecDense(3, []float64{1.0, 2.0, 3.0})
-	yData := mat.NewVecDense(3, []float64{4.0, 5.0, 6.0})
-
-	// Perform element-wise addition
-	ctx := &tensor.Context{}
-	addOp := &tensor.Add{}
-	result := addOp.Forward(ctx, xData, yData).(*mat.VecDense)
-
-	fmt.Println("Result of 1D addition:", result.RawVector().Data)
-}
-
-func testAdd2D() {
-	// Initialize 2D tensors
-	xData := mat.NewDense(2, 2, []float64{1.0, 2.0, 3.0, 4.0})
-	yData := mat.NewDense(2, 2, []float64{5.0, 6.0, 7.0, 8.0})
-
-	// Perform element-wise addition
-	ctx := &tensor.Context{}
-	addOp := &tensor.Add{}
-	result := addOp.Forward(ctx, xData, yData).(*mat.Dense)
-
-	fmt.Println("Result of 2D addition:")
-	fmt.Println(mat.Formatted(result))
-}
-
-func testAdd3D() {
-	// Initialize 3D tensors as slices of 2D tensors
-	xData := []*mat.Dense{
-		mat.NewDense(2, 2, []float64{1.0, 2.0, 3.0, 4.0}),
-		mat.NewDense(2, 2, []float64{9.0, 8.0, 7.0, 6.0}),
-	}
-	yData := []*mat.Dense{
-		mat.NewDense(2, 2, []float64{5.0, 6.0, 7.0, 8.0}),
-		mat.NewDense(2, 2, []float64{5.0, 4.0, 3.0, 2.0}),
-	}
-
-	// Perform element-wise addition
-	ctx := &tensor.Context{}
-	addOp := &tensor.Add{}
-	result := addOp.Forward(ctx, xData, yData).([]*mat.Dense)
-
-	fmt.Println("Result of 3D addition:")
-	for i, m := range result {
-		fmt.Printf("Layer %d:\n%v\n", i+1, mat.Formatted(m))
-	}
+func demoActivations() {
+	fmt.Println("[4] Activations")
+	z := tensor.New([]float64{-2, -1, 0, 1, 2}, 5)
+	fmt.Printf("  z         = %v\n", z)
+	fmt.Printf("  ReLU(z)   = %v\n", z.ReLU())
+	fmt.Printf("  Sigmoid(z)= %v\n", z.Sigmoid())
+	fmt.Printf("  Tanh(z)   = %v\n", z.Tanh())
+	fmt.Printf("  GELU(z)   = %v\n", z.GELU())
+	fmt.Printf("  Softmax(z)= %v\n", z.Softmax(0))
+	fmt.Println()
 }

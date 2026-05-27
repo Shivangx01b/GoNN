@@ -1,333 +1,275 @@
+// Package tensor provides the core Tensor type with automatic differentiation.
+//
+// Design follows PyTorch/tinygrad: a Tensor is flat float64 data plus a shape
+// and strides. Operations build a DAG (Tensor.creator); calling Backward()
+// on a scalar walks the graph in reverse topological order and accumulates
+// gradients into leaf tensors that have RequiresGrad set.
 package tensor
 
 import (
+	"fmt"
 	"math"
-
-	"gonum.org/v1/gonum/mat"
+	"math/rand"
+	"strings"
 )
 
-// Context struct to hold operation context
-type Context struct {
-	parents      []*Tensor
-	savedTensors []interface{} // Interface type to save any tensor dimension
-}
-
-// Save tensors for backward pass
-func (c *Context) SaveForBackward(tensors ...interface{}) {
-	c.savedTensors = append(c.savedTensors, tensors...)
-}
-
-// Tensor struct represents a tensor
+// Tensor is the core n-dimensional array with autograd.
 type Tensor struct {
-	data  interface{} // Can be *mat.VecDense, *mat.Dense, or []*mat.Dense for 1D, 2D, or 3D tensors respectively
-	grad  interface{} // Same as data
-	shape []int       // Shape of the tensor
-	ctx   *Context
+	Data         []float64
+	Shape        []int
+	Strides      []int
+	RequiresGrad bool
+	Grad         *Tensor
+	creator      *Function
 }
 
-// Function interface for operations
-type Function interface {
-	Forward(ctx *Context, inputs ...interface{}) interface{}
-	Backward(ctx *Context, gradOutput interface{}) []interface{}
+// Function records the op that produced a tensor and how to backprop.
+type Function struct {
+	Name    string
+	Inputs  []*Tensor
+	Saved   []interface{}
+	Backward func(grad *Tensor, saved []interface{}, inputs []*Tensor) []*Tensor
 }
 
-// Mul operation for element-wise multiplication
-type Mul struct{}
+// New creates a tensor wrapping data with the given shape.
+func New(data []float64, shape ...int) *Tensor {
+	if len(shape) == 0 {
+		shape = []int{len(data)}
+	}
+	n := numel(shape)
+	if len(data) != n {
+		panic(fmt.Sprintf("tensor.New: data length %d does not match shape %v (numel=%d)", len(data), shape, n))
+	}
+	return &Tensor{Data: data, Shape: append([]int(nil), shape...), Strides: contiguousStrides(shape)}
+}
 
-func (m *Mul) Forward(ctx *Context, inputs ...interface{}) interface{} {
-	x, y := inputs[0], inputs[1]
-	ctx.SaveForBackward(x, y)
+// NewLike returns a tensor with the same shape as t, filled with zeros.
+func NewLike(t *Tensor) *Tensor { return Zeros(t.Shape...) }
 
-	switch xt := x.(type) {
-	case *mat.VecDense:
-		yt := y.(*mat.VecDense)
-		result := mat.NewVecDense(xt.Len(), nil)
-		for i := 0; i < xt.Len(); i++ {
-			result.SetVec(i, xt.AtVec(i)*yt.AtVec(i))
-		}
-		return result
-	case *mat.Dense:
-		yt := y.(*mat.Dense)
-		r, c := xt.Dims()
-		result := mat.NewDense(r, c, nil)
-		result.MulElem(xt, yt)
-		return result
-	case []*mat.Dense:
-		yt := y.([]*mat.Dense)
-		result := make([]*mat.Dense, len(xt))
-		for i := range xt {
-			r, c := xt[i].Dims()
-			result[i] = mat.NewDense(r, c, nil)
-			result[i].MulElem(xt[i], yt[i])
-		}
-		return result
-	default:
-		panic("unsupported tensor type")
+// Zeros returns a tensor of zeros with the given shape.
+func Zeros(shape ...int) *Tensor {
+	return &Tensor{Data: make([]float64, numel(shape)), Shape: append([]int(nil), shape...), Strides: contiguousStrides(shape)}
+}
+
+// Ones returns a tensor of ones with the given shape.
+func Ones(shape ...int) *Tensor {
+	t := Zeros(shape...)
+	for i := range t.Data {
+		t.Data[i] = 1
+	}
+	return t
+}
+
+// Full returns a tensor filled with v.
+func Full(v float64, shape ...int) *Tensor {
+	t := Zeros(shape...)
+	for i := range t.Data {
+		t.Data[i] = v
+	}
+	return t
+}
+
+// Randn returns a tensor sampled from N(0, 1).
+func Randn(shape ...int) *Tensor {
+	t := Zeros(shape...)
+	for i := range t.Data {
+		t.Data[i] = rand.NormFloat64()
+	}
+	return t
+}
+
+// Uniform returns a tensor sampled uniformly from [low, high).
+func Uniform(low, high float64, shape ...int) *Tensor {
+	t := Zeros(shape...)
+	for i := range t.Data {
+		t.Data[i] = low + rand.Float64()*(high-low)
+	}
+	return t
+}
+
+// Arange returns [start, start+step, ..., stop).
+func Arange(start, stop, step float64) *Tensor {
+	if step == 0 {
+		panic("tensor.Arange: step must be non-zero")
+	}
+	n := int(math.Ceil((stop - start) / step))
+	if n < 0 {
+		n = 0
+	}
+	d := make([]float64, n)
+	for i := 0; i < n; i++ {
+		d[i] = start + float64(i)*step
+	}
+	return New(d, n)
+}
+
+// Eye returns the n x n identity matrix.
+func Eye(n int) *Tensor {
+	t := Zeros(n, n)
+	for i := 0; i < n; i++ {
+		t.Data[i*n+i] = 1
+	}
+	return t
+}
+
+// Scalar returns a 0-d tensor holding v.
+func Scalar(v float64) *Tensor {
+	return &Tensor{Data: []float64{v}, Shape: []int{}, Strides: []int{}}
+}
+
+// Copy makes a deep copy of t (does not copy creator/grad).
+func (t *Tensor) Copy() *Tensor {
+	d := make([]float64, len(t.Data))
+	copy(d, t.Data)
+	return &Tensor{
+		Data:         d,
+		Shape:        append([]int(nil), t.Shape...),
+		Strides:      append([]int(nil), t.Strides...),
+		RequiresGrad: t.RequiresGrad,
 	}
 }
 
-func (m *Mul) Backward(ctx *Context, gradOutput interface{}) []interface{} {
-	savedTensors := ctx.savedTensors
-	x, y := savedTensors[0], savedTensors[1]
+// SetRequiresGrad enables gradient tracking and returns t for chaining.
+func (t *Tensor) SetRequiresGrad(b bool) *Tensor {
+	t.RequiresGrad = b
+	return t
+}
 
-	// Determine the type of tensors to apply correct differentiation logic
-	switch xt := x.(type) {
-	case *mat.VecDense:
-		yt := y.(*mat.VecDense)
-		gradOutputVec := gradOutput.(*mat.VecDense)
+// Numel returns the number of elements.
+func (t *Tensor) Numel() int { return len(t.Data) }
 
-		// Calculate gradients for 1D tensors
-		gradX := mat.NewVecDense(xt.Len(), nil)
-		gradY := mat.NewVecDense(yt.Len(), nil)
-		for i := 0; i < xt.Len(); i++ {
-			gradX.SetVec(i, yt.AtVec(i)*gradOutputVec.AtVec(i))
-			gradY.SetVec(i, xt.AtVec(i)*gradOutputVec.AtVec(i))
+// Dim returns the number of dimensions.
+func (t *Tensor) Dim() int { return len(t.Shape) }
+
+// Item returns the scalar value (only valid for tensors with 1 element).
+func (t *Tensor) Item() float64 {
+	if len(t.Data) != 1 {
+		panic("tensor.Item: only valid for single-element tensors")
+	}
+	return t.Data[0]
+}
+
+// String formats the tensor for printing.
+func (t *Tensor) String() string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Tensor(shape=%v, data=", t.Shape))
+	const maxPrint = 16
+	if len(t.Data) <= maxPrint {
+		sb.WriteString(fmt.Sprintf("%v", t.Data))
+	} else {
+		sb.WriteString(fmt.Sprintf("[%v ... %v]", t.Data[:8], t.Data[len(t.Data)-8:]))
+	}
+	if t.RequiresGrad {
+		sb.WriteString(", requires_grad=true")
+	}
+	sb.WriteString(")")
+	return sb.String()
+}
+
+// ZeroGrad zeros the gradient.
+func (t *Tensor) ZeroGrad() {
+	if t.Grad != nil {
+		for i := range t.Grad.Data {
+			t.Grad.Data[i] = 0
 		}
-		return []interface{}{gradX, gradY}
+	}
+}
 
-	case *mat.Dense:
-		yt := y.(*mat.Dense)
-		gradOutputDense := gradOutput.(*mat.Dense)
-
-		// Calculate gradients for 2D tensors
-		r, c := xt.Dims()
-		gradX := mat.NewDense(r, c, nil)
-		gradY := mat.NewDense(r, c, nil)
-		for i := 0; i < r; i++ {
-			for j := 0; j < c; j++ {
-				gradX.Set(i, j, yt.At(i, j)*gradOutputDense.At(i, j))
-				gradY.Set(i, j, xt.At(i, j)*gradOutputDense.At(i, j))
+// Backward computes gradients by walking the autograd DAG in reverse.
+// t must be a scalar (or you must call .Sum() first).
+func (t *Tensor) Backward() {
+	if len(t.Data) != 1 {
+		panic("tensor.Backward: can only call on scalar tensors. Use t.Sum().Backward()")
+	}
+	// Build topological order: parents before children.
+	visited := map[*Tensor]bool{}
+	order := []*Tensor{}
+	var visit func(*Tensor)
+	visit = func(n *Tensor) {
+		if visited[n] || n == nil {
+			return
+		}
+		visited[n] = true
+		if n.creator != nil {
+			for _, p := range n.creator.Inputs {
+				visit(p)
 			}
 		}
-		return []interface{}{gradX, gradY}
+		order = append(order, n)
+	}
+	visit(t)
 
-	case []*mat.Dense:
-		yt := y.([]*mat.Dense)
-		gradOutputDense := gradOutput.([]*mat.Dense)
+	// Seed gradient at root.
+	if t.Grad == nil {
+		t.Grad = Ones(t.Shape...)
+	} else {
+		for i := range t.Grad.Data {
+			t.Grad.Data[i] = 1
+		}
+	}
 
-		// Calculate gradients for 3D tensors
-		gradX := make([]*mat.Dense, len(xt))
-		gradY := make([]*mat.Dense, len(yt))
-		for k := range xt {
-			r, c := xt[k].Dims()
-			gradX[k] = mat.NewDense(r, c, nil)
-			gradY[k] = mat.NewDense(r, c, nil)
-			for i := 0; i < r; i++ {
-				for j := 0; j < c; j++ {
-					gradX[k].Set(i, j, yt[k].At(i, j)*gradOutputDense[k].At(i, j))
-					gradY[k].Set(i, j, xt[k].At(i, j)*gradOutputDense[k].At(i, j))
+	// Walk in reverse, pushing grads to inputs.
+	for i := len(order) - 1; i >= 0; i-- {
+		n := order[i]
+		if n.creator == nil {
+			continue
+		}
+		grads := n.creator.Backward(n.Grad, n.creator.Saved, n.creator.Inputs)
+		for j, p := range n.creator.Inputs {
+			if !p.RequiresGrad && p.creator == nil {
+				continue
+			}
+			if grads[j] == nil {
+				continue
+			}
+			g := grads[j]
+			// Sum-reduce gradient back to p's shape if broadcasting expanded it.
+			g = unbroadcast(g, p.Shape)
+			if p.Grad == nil {
+				p.Grad = g
+			} else {
+				for k := range p.Grad.Data {
+					p.Grad.Data[k] += g.Data[k]
 				}
 			}
 		}
-		return []interface{}{gradX, gradY}
-
-	default:
-		panic("unsupported tensor type in backward pass")
 	}
 }
 
-// Add operation supports 1D, 2D, and 3D tensors
-type Add struct{}
-
-func (a *Add) Forward(ctx *Context, inputs ...interface{}) interface{} {
-	x, y := inputs[0], inputs[1]
-
-	// Handle 1D tensors
-	if xv, ok := x.(*mat.VecDense); ok {
-		yv := y.(*mat.VecDense)
-		result := mat.NewVecDense(xv.Len(), nil)
-		result.AddVec(xv, yv)
-		return result
+// numel returns the product of dims.
+func numel(shape []int) int {
+	if len(shape) == 0 {
+		return 1
 	}
-
-	// Handle 2D tensors
-	if xd, ok := x.(*mat.Dense); ok {
-		yd := y.(*mat.Dense)
-		r, c := xd.Dims()                 // Capture the number of rows and columns separately
-		result := mat.NewDense(r, c, nil) // Use the separate row and column counts here
-		result.Add(xd, yd)
-		return result
+	n := 1
+	for _, d := range shape {
+		n *= d
 	}
-
-	// Handle 3D tensors as slices of *mat.Dense
-	if x3d, ok := x.([]*mat.Dense); ok {
-		y3d := y.([]*mat.Dense)
-		result := make([]*mat.Dense, len(x3d))
-		for i, xd := range x3d {
-			r, c := xd.Dims()                   // Capture the dimensions of the current 2D tensor
-			result[i] = mat.NewDense(r, c, nil) // Initialize a new *mat.Dense with the correct dimensions
-			result[i].Add(xd, y3d[i])           // Perform element-wise addition
-		}
-		return result
-	}
-
-	panic("unsupported tensor type in Add operation")
+	return n
 }
 
-func (a *Add) Backward(ctx *Context, gradOutput interface{}) []interface{} {
-	// The gradient of an addition operation is simply passed through to both inputs.
-	// This logic is the same regardless of the tensor dimensionality, but we need to match the type.
-
-	// Handle 1D tensors
-	if goVec, ok := gradOutput.(*mat.VecDense); ok {
-		return []interface{}{goVec, goVec}
+// contiguousStrides returns row-major strides for shape.
+func contiguousStrides(shape []int) []int {
+	if len(shape) == 0 {
+		return []int{}
 	}
-
-	// Handle 2D tensors
-	if goDense, ok := gradOutput.(*mat.Dense); ok {
-		return []interface{}{goDense, goDense}
+	s := make([]int, len(shape))
+	s[len(shape)-1] = 1
+	for i := len(shape) - 2; i >= 0; i-- {
+		s[i] = s[i+1] * shape[i+1]
 	}
-
-	// Handle 3D tensors
-	if go3d, ok := gradOutput.([]*mat.Dense); ok {
-		gradX := make([]*mat.Dense, len(go3d))
-		gradY := make([]*mat.Dense, len(go3d))
-		for i, goDense := range go3d {
-			gradX[i] = goDense
-			gradY[i] = goDense
-		}
-		return []interface{}{gradX, gradY}
-	}
-
-	panic("unsupported gradient output type in Add operation backward pass")
+	return s
 }
 
-// ReLU operation
-type ReLU struct{}
-
-func (r *ReLU) Forward(ctx *Context, inputs ...[]float64) []float64 {
-	input := inputs[0]
-	result := make([]float64, len(input))
-	for i, val := range input {
-		if val > 0 {
-			result[i] = val
+// shapesEqual reports whether two shapes are identical.
+func shapesEqual(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
-	ctx.SaveForBackward(input)
-	return result
-}
-
-func (r *ReLU) Backward(ctx *Context, gradOutput []float64) [][]float64 {
-	input := ctx.savedTensors[0].([]float64)
-	gradInput := make([]float64, len(input))
-	for i, val := range input {
-		if val > 0 {
-			gradInput[i] = gradOutput[i]
-		}
-	}
-	return [][]float64{gradInput}
-}
-
-// Dot operation (simplified for 1D vectors)
-type Dot struct{}
-
-func (d *Dot) Forward(ctx *Context, inputs ...[]float64) []float64 {
-	x, y := inputs[0], inputs[1]
-	if len(x) != len(y) {
-		panic("Dot: input vectors must be of the same length")
-	}
-	var result float64
-	for i := range x {
-		result += x[i] * y[i]
-	}
-	ctx.SaveForBackward(x, y)
-	return []float64{result}
-}
-
-func (d *Dot) Backward(ctx *Context, gradOutput []float64) [][]float64 {
-	x, y := ctx.savedTensors[0].([]float64), ctx.savedTensors[1].([]float64)
-	gradX := make([]float64, len(x))
-	gradY := make([]float64, len(y))
-	for i := range x {
-		gradX[i] = y[i] * gradOutput[0]
-		gradY[i] = x[i] * gradOutput[0]
-	}
-	return [][]float64{gradX, gradY}
-}
-
-// Sum operation (simplified version)
-type Sum struct{}
-
-func (s *Sum) Forward(ctx *Context, inputs ...[]float64) []float64 {
-	input := inputs[0]
-	var sum float64
-	for _, val := range input {
-		sum += val
-	}
-	ctx.SaveForBackward(input)
-	return []float64{sum}
-}
-
-func (s *Sum) Backward(ctx *Context, gradOutput []float64) [][]float64 {
-	input := ctx.savedTensors[0].([]float64)
-	gradInput := make([]float64, len(input))
-	for i := range gradInput {
-		gradInput[i] = gradOutput[0]
-	}
-	return [][]float64{gradInput}
-}
-
-// LogSoftmax operation (simplified version)
-type LogSoftmax struct{}
-
-func (l *LogSoftmax) Forward(ctx *Context, inputs ...[]float64) []float64 {
-	input := inputs[0]
-	maxVal := max(input)
-	stableInput := make([]float64, len(input))
-	for i, val := range input {
-		stableInput[i] = val - maxVal
-	}
-	expSum := sumExp(stableInput)
-	logSoftmax := make([]float64, len(input))
-	for i, val := range stableInput {
-		logSoftmax[i] = val - math.Log(expSum)
-	}
-	ctx.SaveForBackward(logSoftmax)
-	return logSoftmax
-}
-
-func (l *LogSoftmax) Backward(ctx *Context, gradOutput []float64) [][]float64 {
-	output := ctx.savedTensors[0].([]float64)
-	gradInput := make([]float64, len(output))
-	expOutput := exp(output)
-	sumGradOutput := sum(gradOutput)
-	for i := range output {
-		gradInput[i] = gradOutput[i] - expOutput[i]*sumGradOutput
-	}
-	return [][]float64{gradInput}
-}
-
-// Helper functions for LogSoftmax
-func max(a []float64) float64 {
-	maxVal := a[0]
-	for _, val := range a[1:] {
-		if val > maxVal {
-			maxVal = val
-		}
-	}
-	return maxVal
-}
-
-func sumExp(a []float64) float64 {
-	var sum float64
-	for _, val := range a {
-		sum += math.Exp(val)
-	}
-	return sum
-}
-
-func exp(a []float64) []float64 {
-	result := make([]float64, len(a))
-	for i, val := range a {
-		result[i] = math.Exp(val)
-	}
-	return result
-}
-
-func sum(a []float64) float64 {
-	var sum float64
-	for _, val := range a {
-		sum += val
-	}
-	return sum
+	return true
 }
