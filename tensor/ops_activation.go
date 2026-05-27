@@ -1,6 +1,9 @@
 package tensor
 
-import "math"
+import (
+	"math"
+	"math/rand"
+)
 
 // Activation functions (forward + autograd backward).
 
@@ -257,4 +260,131 @@ func (t *Tensor) LogSoftmax(axis int) *Tensor {
 	shifted := t.Sub(mx)
 	logSum := shifted.Exp().SumAxis(axis, true).Log()
 	return shifted.Sub(logSum)
+}
+
+// LogSigmoid returns log(sigmoid(x)) = -softplus(-x).
+// Forward is computed in a numerically stable way:
+//   log(sigmoid(x)) = -log(1 + exp(-x)) = min(0, x) - log(1 + exp(-|x|)).
+// Backward: d/dx log(sigmoid(x)) = 1 - sigmoid(x) = sigmoid(-x) = 1/(1+exp(x)).
+func (t *Tensor) LogSigmoid() *Tensor {
+	return unaryOp(t, "LogSigmoid",
+		func(v float64) float64 {
+			// stable: -softplus(-v)
+			if -v > 20 {
+				// softplus(-v) ~= -v
+				return v
+			}
+			return -math.Log(1 + math.Exp(-v))
+		},
+		func(g, x, y float64) float64 { return g / (1 + math.Exp(x)) })
+}
+
+// Hardshrink: x if |x| > lambda else 0. Gradient is 1 in the same region.
+func (t *Tensor) Hardshrink(lambda float64) *Tensor {
+	return unaryOp(t, "Hardshrink",
+		func(v float64) float64 {
+			if v > lambda || v < -lambda {
+				return v
+			}
+			return 0
+		},
+		func(g, x, y float64) float64 {
+			if x > lambda || x < -lambda {
+				return g
+			}
+			return 0
+		})
+}
+
+// Softshrink: sign(x) * max(|x| - lambda, 0). Gradient is 1 where |x| > lambda.
+func (t *Tensor) Softshrink(lambda float64) *Tensor {
+	return unaryOp(t, "Softshrink",
+		func(v float64) float64 {
+			if v > lambda {
+				return v - lambda
+			}
+			if v < -lambda {
+				return v + lambda
+			}
+			return 0
+		},
+		func(g, x, y float64) float64 {
+			if x > lambda || x < -lambda {
+				return g
+			}
+			return 0
+		})
+}
+
+// Tanhshrink returns x - tanh(x).
+// d/dx (x - tanh(x)) = 1 - (1 - tanh^2(x)) = tanh^2(x).
+func (t *Tensor) Tanhshrink() *Tensor {
+	return unaryOp(t, "Tanhshrink",
+		func(v float64) float64 { return v - math.Tanh(v) },
+		func(g, x, y float64) float64 {
+			th := math.Tanh(x)
+			return g * th * th
+		})
+}
+
+// Threshold: x if x > thresh else value. Gradient is 1 where x > thresh.
+func (t *Tensor) Threshold(thresh, value float64) *Tensor {
+	return unaryOp(t, "Threshold",
+		func(v float64) float64 {
+			if v > thresh {
+				return v
+			}
+			return value
+		},
+		func(g, x, y float64) float64 {
+			if x > thresh {
+				return g
+			}
+			return 0
+		})
+}
+
+// CELU: max(0,x) + min(0, alpha*(exp(x/alpha)-1)).
+// d/dx = 1 for x > 0; otherwise exp(x/alpha).
+func (t *Tensor) CELU(alpha float64) *Tensor {
+	if alpha == 0 {
+		panic("CELU: alpha must be non-zero")
+	}
+	return unaryOp(t, "CELU",
+		func(v float64) float64 {
+			if v > 0 {
+				return v
+			}
+			return alpha * (math.Exp(v/alpha) - 1)
+		},
+		func(g, x, y float64) float64 {
+			if x > 0 {
+				return g
+			}
+			return g * math.Exp(x/alpha)
+		})
+}
+
+// RReLU: Randomized leaky ReLU. PyTorch samples a random slope per element
+// from U(lower, upper) at training time. To keep the unaryOp signature (which
+// stores only forward/backward closures keyed on (x, y)), this implementation
+// is deterministic and uses the midpoint slope = (lower+upper)/2, mirroring
+// PyTorch's eval-mode behavior. The rng parameter is accepted for API parity
+// but currently unused; pass nil if you don't care.
+func (t *Tensor) RReLU(lower, upper float64, rng *rand.Rand) *Tensor {
+	_ = rng
+	slope := 0.5 * (lower + upper)
+	return unaryOp(t, "RReLU",
+		func(v float64) float64 {
+			if v >= 0 {
+				return v
+			}
+			return slope * v
+		},
+		func(g, x, y float64) float64 {
+			if x >= 0 {
+				return g
+			}
+			return g * slope
+		})
 }

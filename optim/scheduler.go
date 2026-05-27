@@ -176,6 +176,129 @@ func (s *ReduceLROnPlateau) Step(lossValue float64) {
 	}
 }
 
+// PolynomialLR decays the lr as initial_lr * (1 - step/totalIters)^power.
+// Once `count` reaches totalIters the lr is clamped at 0.
+type PolynomialLR struct {
+	opt        Optimizer
+	totalIters int
+	power      float64
+	baseLR     float64
+	count      int
+}
+
+// NewPolynomialLR constructs a PolynomialLR scheduler.
+func NewPolynomialLR(opt Optimizer, totalIters int, power float64) *PolynomialLR {
+	return &PolynomialLR{
+		opt:        opt,
+		totalIters: totalIters,
+		power:      power,
+		baseLR:     opt.LR(),
+	}
+}
+
+// Step advances the scheduler one tick.
+func (s *PolynomialLR) Step() {
+	s.count++
+	if s.totalIters <= 0 {
+		return
+	}
+	if s.count >= s.totalIters {
+		s.opt.SetLR(0)
+		return
+	}
+	frac := 1 - float64(s.count)/float64(s.totalIters)
+	s.opt.SetLR(s.baseLR * math.Pow(frac, s.power))
+}
+
+// ChainedScheduler steps a list of schedulers in order on each call.
+type ChainedScheduler struct {
+	schedulers []Scheduler
+}
+
+// NewChainedScheduler constructs a ChainedScheduler.
+func NewChainedScheduler(schedulers ...Scheduler) *ChainedScheduler {
+	return &ChainedScheduler{schedulers: append([]Scheduler(nil), schedulers...)}
+}
+
+// Step advances every wrapped scheduler one tick, in order.
+func (s *ChainedScheduler) Step() {
+	for _, sub := range s.schedulers {
+		sub.Step()
+	}
+}
+
+// SequentialLR runs schedulers[k] until milestones[k] is reached, then
+// switches to schedulers[k+1]. len(milestones) must equal len(schedulers)-1.
+type SequentialLR struct {
+	schedulers []Scheduler
+	milestones []int
+	count      int
+}
+
+// NewSequentialLR constructs a SequentialLR scheduler.
+func NewSequentialLR(schedulers []Scheduler, milestones []int) *SequentialLR {
+	return &SequentialLR{
+		schedulers: append([]Scheduler(nil), schedulers...),
+		milestones: append([]int(nil), milestones...),
+	}
+}
+
+// Step advances the active sub-scheduler. The active index advances past each
+// milestone as the running counter crosses it.
+func (s *SequentialLR) Step() {
+	s.count++
+	idx := 0
+	for i, m := range s.milestones {
+		if s.count > m {
+			idx = i + 1
+		} else {
+			break
+		}
+	}
+	if idx >= len(s.schedulers) {
+		idx = len(s.schedulers) - 1
+	}
+	if idx < 0 || idx >= len(s.schedulers) {
+		return
+	}
+	s.schedulers[idx].Step()
+}
+
+// CyclicLR follows a triangular schedule between baseLR and maxLR. Each half
+// cycle lasts stepSize calls: the lr ramps up for stepSize steps, then down
+// for stepSize steps, then repeats.
+type CyclicLR struct {
+	opt      Optimizer
+	baseLR   float64
+	maxLR    float64
+	stepSize int
+	count    int
+}
+
+// NewCyclicLR constructs a CyclicLR scheduler.
+func NewCyclicLR(opt Optimizer, baseLR, maxLR float64, stepSize int) *CyclicLR {
+	c := &CyclicLR{
+		opt:      opt,
+		baseLR:   baseLR,
+		maxLR:    maxLR,
+		stepSize: stepSize,
+	}
+	c.opt.SetLR(baseLR)
+	return c
+}
+
+// Step advances the scheduler one tick.
+func (s *CyclicLR) Step() {
+	s.count++
+	if s.stepSize <= 0 {
+		return
+	}
+	cycle := math.Floor(1 + float64(s.count)/(2*float64(s.stepSize)))
+	x := math.Abs(float64(s.count)/float64(s.stepSize) - 2*cycle + 1)
+	lr := s.baseLR + (s.maxLR-s.baseLR)*math.Max(0, 1-x)
+	s.opt.SetLR(lr)
+}
+
 // OneCycleLR is a simple triangular one-cycle schedule that ramps the lr
 // from the optimizer's initial lr up to maxLR at the midpoint of totalSteps
 // and back down to the initial lr.

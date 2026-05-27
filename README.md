@@ -16,9 +16,27 @@ A pure-Go deep learning and machine learning framework with PyTorch-style autogr
 GoNN is a single-binary, dependency-light alternative to PyTorch / tinygrad / TensorFlow, written in Go. It provides:
 
 - **Autograd Tensor** — flat-buffer `*tensor.Tensor` with shape + strides + automatic differentiation by reverse-mode graph traversal.
-- **`nn` package** — `Linear`, `Conv2d`, `BatchNorm`, `LayerNorm`, `RMSNorm`, `Dropout`, `Embedding`, `RNN`, `LSTM`, `GRU`, `MultiHeadAttention`, `Transformer{Encoder,Decoder}`, `Sequential`, and the full activation/loss catalogue.
-- **`optim` package** — SGD (with momentum / Nesterov), Adam, AdamW, RMSprop, Adagrad, Adadelta, NAdam, plus LR schedulers (StepLR, MultiStepLR, ExponentialLR, CosineAnnealingLR, LinearLR, ReduceLROnPlateau, OneCycleLR).
-- **`ml` package** — classical algorithms: LinearRegression, Ridge, LogisticRegression, KMeans, KNN, DecisionTree, RandomForest, GradientBoosting, NaiveBayes (Gaussian / Multinomial / Bernoulli), PCA, LinearSVC, DBSCAN, AgglomerativeClustering, plus preprocessing (StandardScaler, MinMaxScaler, OneHotEncoder, PolynomialFeatures) and metrics.
+- **`nn` package** —
+  - **Linear & conv:** `Linear`, `Conv1d`, `Conv2d`, `Conv3d`, `ConvTranspose1d/2d/3d`, `Embedding`.
+  - **Pooling:** `MaxPool2d`, `AvgPool2d`, `AdaptiveMaxPool1d/2d/3d`, `AdaptiveAvgPool1d/2d/3d`.
+  - **Normalization:** `BatchNorm1d`, `BatchNorm2d`, `LayerNorm`, `GroupNorm`, `RMSNorm`, `InstanceNorm1d/2d`.
+  - **Padding & upsample:** `ZeroPad2d`, `ConstantPad2d`, `ReflectionPad2d`, `ReplicationPad2d`, `Upsample`, `PixelShuffle`/`PixelUnshuffle`.
+  - **Recurrent:** `RNN`, `LSTM`, `GRU` (single layer), `RNNCell`, `LSTMCell`, `GRUCell`, `MultiLayerRNN`, `MultiLayerLSTM`, `MultiLayerGRU` (multi-layer + bidirectional), `Seq2Seq`.
+  - **Attention/Transformer:** `MultiHeadAttention` (optional causal mask), `TransformerEncoderLayer`/`TransformerEncoder`, `TransformerDecoderLayer`/`TransformerDecoder`.
+  - **Containers:** `Sequential`, `Dropout`.
+  - **Parametric/gated activations as modules:** `PReLU` (learnable slope), `GLU`.
+- **`optim` package** — SGD (momentum/Nesterov), Adam, AdamW, RMSprop, Adagrad, Adadelta, NAdam, Adamax, RAdam, LBFGS (closure-style), Rprop, plus LR schedulers (StepLR, MultiStepLR, ExponentialLR, CosineAnnealingLR, LinearLR, PolynomialLR, ChainedScheduler, SequentialLR, CyclicLR, ReduceLROnPlateau, OneCycleLR).
+- **`ml` package** — classical algorithms:
+  - **Linear:** LinearRegression, Ridge, Lasso, ElasticNet, BayesianRidge, LogisticRegression.
+  - **Discriminant:** LinearDiscriminantAnalysis (LDA, with Fisher transform), QuadraticDiscriminantAnalysis (QDA).
+  - **Trees & ensembles:** DecisionTreeClassifier/Regressor, RandomForestClassifier/Regressor, ExtraTreesClassifier/Regressor, AdaBoostClassifier, GradientBoostingClassifier/Regressor, IsolationForest.
+  - **Neighbors:** KNNClassifier, KNNRegressor.
+  - **SVM:** LinearSVC.
+  - **Naive Bayes:** GaussianNB, MultinomialNB, BernoulliNB.
+  - **Clustering:** KMeans, DBSCAN, AgglomerativeClustering, MeanShift, GaussianMixture.
+  - **Dim. reduction:** PCA, KernelPCA, FastICA, TSNE.
+  - **Preprocessing:** StandardScaler, MinMaxScaler, OneHotEncoder, LabelEncoder, PolynomialFeatures.
+  - **Metrics + model selection:** Accuracy, Precision/Recall/F1, ConfusionMatrix, MSE/MAE/R²/SilhouetteScore/ROCAUC, TrainTestSplit, KFold, CrossValScore.
 - **`data` package** — `Dataset`, `DataLoader`, transforms, MNIST/CSV loaders, synthetic dataset generators (`MakeRegression`, `MakeClassification`, `MakeBlobs`, `MakeMoons`).
 - **`backend` package** — CPU by default. CUDA via `-tags cuda` (CGO bindings to `backend/cuda/gonn_cuda.cu`, cuBLAS-backed matmul).
 
@@ -130,7 +148,7 @@ gb.Fit(Xtr, ytr)
 | Unary      | `Exp`, `Log`, `Sqrt`, `Sin`, `Cos`, `Tan`, `Abs`, `Reciprocal`, `Pow`, `Square`, `Clip` |
 | Reduction  | `Sum`, `Mean`, `Max`, `Min`, `SumAxis`, `MeanAxis`, `MaxAxis`, `MinAxis`, `ArgMax`, `ArgMin` |
 | Shape      | `Reshape`, `View`, `Flatten`, `Transpose`, `T`, `Permute`, `Squeeze`, `Unsqueeze`, `Expand`, `Concat`, `Stack` |
-| Activation | `ReLU`, `LeakyReLU`, `ELU`, `SELU`, `Sigmoid`, `Tanh`, `HardTanh`, `HardSigmoid`, `Softplus`, `Softsign`, `GELU`, `SiLU` (Swish), `HardSwish`, `Mish`, `ReLU6`, `Softmax`, `LogSoftmax` |
+| Activation | `ReLU`, `LeakyReLU`, `ELU`, `SELU`, `CELU`, `Sigmoid`, `Tanh`, `LogSigmoid`, `HardTanh`, `HardSigmoid`, `Softplus`, `Softsign`, `GELU`, `SiLU` (Swish), `HardSwish`, `Mish`, `ReLU6`, `Hardshrink`, `Softshrink`, `Tanhshrink`, `Threshold`, `RReLU`, `Softmax`, `LogSoftmax` |
 | Autograd   | `SetRequiresGrad`, `Backward`, `ZeroGrad`, `.Grad` |
 
 ## CUDA backend
@@ -148,6 +166,17 @@ go build -tags cuda ./...
 
 The CUDA implementation lives in `backend/cuda/gonn_cuda.cu`. The Go side calls into it via CGO and uses cuBLAS for matmul. The CPU and CUDA backends share the same `backend.Backend` interface so callers do not need to change.
 
+The GPU backend currently accelerates:
+
+| Category    | Ops |
+|-------------|-----|
+| MatMul      | `MatMul` (cuBLAS `Dgemm`) |
+| Elementwise | `AddElem`, `MulElem`, `Sub`, `Div`, `Scale`, `AxpyInto` (in-place `out += alpha*x`) |
+| Reductions  | `Sum`, `Max` (single-block tree reduce in shared memory) |
+| Activations | `ReLU`, `Sigmoid`, `Tanh`, `Exp`, `Log`, `GELU` (tanh approx.), `SiLU` (Swish) |
+
+Each op follows the same pattern as the original `gonn_add` / `gonn_mul` kernels: copy input slices to device memory, launch the kernel, copy the result back. There is no device-side buffer caching yet — correctness first, performance later.
+
 ## Project layout
 
 ```
@@ -163,6 +192,20 @@ GoNN/
 └── main.go        # Top-level smoke test
 ```
 
+## Loss reference
+
+`MSELoss`, `MAELoss` / `L1Loss`, `SmoothL1Loss`, `HuberLoss`, `CrossEntropyLoss`, `NLLLoss`, `BCELoss`, `BCEWithLogitsLoss`, `KLDivLoss`, `PoissonNLLLoss`, `GaussianNLLLoss`, `MarginRankingLoss`, `HingeEmbeddingLoss`, `CosineEmbeddingLoss`, `TripletMarginLoss`, `MultiMarginLoss`.
+
+## Examples
+
+Runnable demos under `examples/`:
+
+- `examples/regression` — linear regression with SGD.
+- `examples/mlp` — 3-class MLP classifier with Adam (reaches 100%).
+- `examples/cnn` — Conv2d + MaxPool2d + AdaptiveAvgPool2d image classifier.
+- `examples/transformer` — small transformer encoder + classification head.
+- `examples/ml_classical` — LinearRegression + KMeans + PCA.
+
 ## Status
 
-Active development. The tensor + autograd core, all major NN layers, all common optimizers, and the classical ML catalogue are implemented and tested. Coverage of more exotic PyTorch / sklearn corners (sparse ops, distributed training, JIT) is intentionally not pursued.
+The tensor + autograd core, the full NN layer catalogue (linear, conv 1/2/3-d, conv-transpose, pooling/adaptive pooling, normalization, padding, upsample, RNN/LSTM/GRU with cells and bidirectional/multi-layer variants, Seq2Seq, attention, transformer encoder/decoder), all common optimizers and schedulers, and the classical ML catalogue (linear, discriminant, trees, ensembles, boosting, isolation forest, SVM, NB, KNN, clustering, dimensionality reduction, preprocessing, metrics) are implemented and tested. Coverage of more exotic corners (sparse ops, distributed training, JIT, CTC) is intentionally not pursued.

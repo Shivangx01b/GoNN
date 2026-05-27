@@ -83,3 +83,116 @@ func KLDivLoss(input, target *tensor.Tensor) *tensor.Tensor {
 	tClipped := target.Clip(1e-12, math.Inf(1))
 	return target.Mul(tClipped.Log().Sub(input)).Mean()
 }
+
+// SmoothL1Loss is the Smooth-L1 / Huber-style loss with transition point beta.
+// It is mathematically identical to HuberLoss with delta=beta.
+func SmoothL1Loss(pred, target *tensor.Tensor, beta float64) *tensor.Tensor {
+	return HuberLoss(pred, target, beta)
+}
+
+// L1Loss is an alias for MAELoss (mean absolute error).
+func L1Loss(pred, target *tensor.Tensor) *tensor.Tensor { return MAELoss(pred, target) }
+
+// PoissonNLLLoss: negative log likelihood of a Poisson distribution.
+// If logInput is true: loss = mean(exp(input) - target*input).
+// Else                : loss = mean(input - target*log(input + eps)).
+func PoissonNLLLoss(input, target *tensor.Tensor, logInput bool) *tensor.Tensor {
+	if logInput {
+		return input.Exp().Sub(target.Mul(input)).Mean()
+	}
+	const eps = 1e-8
+	logTerm := input.AddScalar(eps).Log()
+	return input.Sub(target.Mul(logTerm)).Mean()
+}
+
+// GaussianNLLLoss: negative log likelihood for a Gaussian with diagonal
+// variance. loss = mean(0.5 * (log(varT) + (input - target)^2 / varT)).
+// varT must be strictly positive.
+func GaussianNLLLoss(input, target, varT *tensor.Tensor) *tensor.Tensor {
+	diff := input.Sub(target)
+	sq := diff.Square()
+	return varT.Log().Add(sq.Div(varT)).MulScalar(0.5).Mean()
+}
+
+// MarginRankingLoss: mean(max(0, -y*(x1-x2) + margin)).
+// y should contain +/-1 entries (broadcast-compatible with x1, x2).
+func MarginRankingLoss(x1, x2, y *tensor.Tensor, margin float64) *tensor.Tensor {
+	diff := x1.Sub(x2)
+	score := y.Mul(diff).Neg().AddScalar(margin) // -y*(x1-x2) + margin
+	return score.Clip(0, math.Inf(1)).Mean()
+}
+
+// HingeEmbeddingLoss: y=1 -> loss=x; y=-1 -> loss=max(0, margin-x). Mean.
+// Implemented as: posMask*x + negMask*max(0, margin-x), where the masks come
+// from y itself: posMask = (y+1)/2, negMask = (1-y)/2.
+func HingeEmbeddingLoss(x, y *tensor.Tensor, margin float64) *tensor.Tensor {
+	posMask := y.AddScalar(1).MulScalar(0.5)
+	negMask := y.Neg().AddScalar(1).MulScalar(0.5)
+	negTerm := x.Neg().AddScalar(margin).Clip(0, math.Inf(1))
+	return posMask.Mul(x).Add(negMask.Mul(negTerm)).Mean()
+}
+
+// CosineEmbeddingLoss: with cosine similarity cs = (x1.x2)/(||x1||*||x2||),
+// loss = mean( y=1  ? 1 - cs
+//              y=-1 ? max(0, cs - margin) ).
+// x1, x2 are (N, D); y is (N,).
+func CosineEmbeddingLoss(x1, x2, y *tensor.Tensor, margin float64) *tensor.Tensor {
+	const eps = 1e-8
+	dot := x1.Mul(x2).SumAxis(1, false)                            // (N,)
+	n1 := x1.Square().SumAxis(1, false).AddScalar(eps).Sqrt()      // (N,)
+	n2 := x2.Square().SumAxis(1, false).AddScalar(eps).Sqrt()      // (N,)
+	cs := dot.Div(n1.Mul(n2))                                      // (N,)
+	posMask := y.AddScalar(1).MulScalar(0.5)                       // 1 when y=1
+	negMask := y.Neg().AddScalar(1).MulScalar(0.5)                 // 1 when y=-1
+	posTerm := cs.Neg().AddScalar(1)                               // 1 - cs
+	negTerm := cs.SubScalar(margin).Clip(0, math.Inf(1))           // max(0, cs - margin)
+	return posMask.Mul(posTerm).Add(negMask.Mul(negTerm)).Mean()
+}
+
+// TripletMarginLoss: mean(max(0, ||a-p||_2 - ||a-n||_2 + margin)).
+// anchor, positive, negative share shape (N, D).
+func TripletMarginLoss(anchor, positive, negative *tensor.Tensor, margin float64) *tensor.Tensor {
+	const eps = 1e-8
+	dp := anchor.Sub(positive).Square().SumAxis(1, false).AddScalar(eps).Sqrt()
+	dn := anchor.Sub(negative).Square().SumAxis(1, false).AddScalar(eps).Sqrt()
+	return dp.Sub(dn).AddScalar(margin).Clip(0, math.Inf(1)).Mean()
+}
+
+// MultiMarginLoss: multi-class hinge loss.
+// input: (N, C); target: (N,) integer class indices stored as float64.
+// loss = mean over batch of mean over non-target classes j of
+//        max(0, margin - input[target] + input[j]).
+func MultiMarginLoss(input, target *tensor.Tensor, margin float64) *tensor.Tensor {
+	if len(input.Shape) != 2 {
+		panic("MultiMarginLoss: input must be 2D (N, C)")
+	}
+	N, C := input.Shape[0], input.Shape[1]
+	if len(target.Data) != N {
+		panic("MultiMarginLoss: target must have N entries")
+	}
+	// Pick the target score per row: x_t with shape (N, 1).
+	mask := tensor.Zeros(N, C)
+	for i, v := range target.Data {
+		idx := int(v)
+		if idx < 0 || idx >= C {
+			panic("MultiMarginLoss: target out of range")
+		}
+		mask.Data[i*C+idx] = 1
+	}
+	xt := input.Mul(mask).SumAxis(1, true) // (N, 1)
+	// margins[i, j] = margin - x_t[i] + input[i, j].
+	margins := input.Sub(xt).AddScalar(margin).Clip(0, math.Inf(1)) // (N, C)
+	// Zero out the target column so it doesn't contribute, then average over
+	// the (C-1) non-target classes per row, then over the batch.
+	nonTargetMask := tensor.Ones(N, C).Sub(mask) // 0 at target col, 1 elsewhere
+	masked := margins.Mul(nonTargetMask)
+	perRow := masked.SumAxis(1, false).DivScalar(float64(C - 1)) // (N,)
+	return perRow.Mean()
+}
+
+// CTCLoss (Connectionist Temporal Classification) is intentionally not
+// implemented in v1. The dynamic-programming forward-backward algorithm over
+// the expanded label sequence with blank tokens and log-space accumulation
+// requires significant additional infrastructure (a real log-sum-exp, custom
+// autograd, masked alignment) that is out of scope here. Track this as a
+// future addition.

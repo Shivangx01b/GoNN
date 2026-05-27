@@ -137,6 +137,129 @@ func (g *GRU) Parameters() []*tensor.Tensor {
 	return append(g.Wih.Parameters(), g.Whh.Parameters()...)
 }
 
+// ============================================================================
+// Single-timestep cells. These let callers drive the recurrence themselves,
+// which is useful for multi-layer/bidirectional stacks and seq2seq decoders.
+// ============================================================================
+
+// RNNCell is a single Elman RNN step: h_t = tanh(W_ih x + W_hh h_{t-1}).
+type RNNCell struct {
+	InputSize  int
+	HiddenSize int
+	Wih        *Linear
+	Whh        *Linear
+}
+
+// NewRNNCell creates an RNNCell.
+func NewRNNCell(in, hidden int) *RNNCell {
+	return &RNNCell{
+		InputSize:  in,
+		HiddenSize: hidden,
+		Wih:        NewLinear(in, hidden, true),
+		Whh:        NewLinear(hidden, hidden, false),
+	}
+}
+
+// Forward consumes one timestep. x: (B, in); h: (B, hidden) (use zeros for t=0).
+// Returns new h of shape (B, hidden).
+func (c *RNNCell) Forward(x, h *tensor.Tensor) *tensor.Tensor {
+	if h == nil {
+		h = tensor.Zeros(x.Shape[0], c.HiddenSize)
+	}
+	return c.Wih.Forward(x).Add(c.Whh.Forward(h)).Tanh()
+}
+
+// Parameters returns the cell's parameters.
+func (c *RNNCell) Parameters() []*tensor.Tensor {
+	return append(c.Wih.Parameters(), c.Whh.Parameters()...)
+}
+
+// LSTMState bundles the hidden and cell state of an LSTM cell.
+type LSTMState struct {
+	H *tensor.Tensor
+	C *tensor.Tensor
+}
+
+// LSTMCell is a single LSTM step.
+type LSTMCell struct {
+	InputSize  int
+	HiddenSize int
+	Wih        *Linear // x -> 4H (i, f, g, o)
+	Whh        *Linear // h -> 4H
+}
+
+// NewLSTMCell creates an LSTMCell.
+func NewLSTMCell(in, hidden int) *LSTMCell {
+	return &LSTMCell{
+		InputSize:  in,
+		HiddenSize: hidden,
+		Wih:        NewLinear(in, 4*hidden, true),
+		Whh:        NewLinear(hidden, 4*hidden, false),
+	}
+}
+
+// Forward consumes one timestep. x: (B, in); state may be nil for t=0.
+// Returns new state (h_t, c_t).
+func (c *LSTMCell) Forward(x *tensor.Tensor, state *LSTMState) *LSTMState {
+	B := x.Shape[0]
+	H := c.HiddenSize
+	if state == nil {
+		state = &LSTMState{H: tensor.Zeros(B, H), C: tensor.Zeros(B, H)}
+	}
+	gates := c.Wih.Forward(x).Add(c.Whh.Forward(state.H)) // (B, 4H)
+	i := sliceCol(gates, 0, H).Sigmoid()
+	f := sliceCol(gates, H, 2*H).Sigmoid()
+	g := sliceCol(gates, 2*H, 3*H).Tanh()
+	o := sliceCol(gates, 3*H, 4*H).Sigmoid()
+	cNew := f.Mul(state.C).Add(i.Mul(g))
+	hNew := o.Mul(cNew.Tanh())
+	return &LSTMState{H: hNew, C: cNew}
+}
+
+// Parameters returns the cell's parameters.
+func (c *LSTMCell) Parameters() []*tensor.Tensor {
+	return append(c.Wih.Parameters(), c.Whh.Parameters()...)
+}
+
+// GRUCell is a single GRU step.
+type GRUCell struct {
+	InputSize  int
+	HiddenSize int
+	Wih        *Linear // x -> 3H (r, z, n)
+	Whh        *Linear // h -> 3H
+}
+
+// NewGRUCell creates a GRUCell.
+func NewGRUCell(in, hidden int) *GRUCell {
+	return &GRUCell{
+		InputSize:  in,
+		HiddenSize: hidden,
+		Wih:        NewLinear(in, 3*hidden, true),
+		Whh:        NewLinear(hidden, 3*hidden, true),
+	}
+}
+
+// Forward consumes one timestep. x: (B, in); h: (B, hidden) or nil.
+// Returns new h.
+func (c *GRUCell) Forward(x, h *tensor.Tensor) *tensor.Tensor {
+	H := c.HiddenSize
+	if h == nil {
+		h = tensor.Zeros(x.Shape[0], H)
+	}
+	one := tensor.Scalar(1)
+	xg := c.Wih.Forward(x)
+	hg := c.Whh.Forward(h)
+	rGate := sliceCol(xg, 0, H).Add(sliceCol(hg, 0, H)).Sigmoid()
+	zGate := sliceCol(xg, H, 2*H).Add(sliceCol(hg, H, 2*H)).Sigmoid()
+	nGate := sliceCol(xg, 2*H, 3*H).Add(rGate.Mul(sliceCol(hg, 2*H, 3*H))).Tanh()
+	return one.Sub(zGate).Mul(nGate).Add(zGate.Mul(h))
+}
+
+// Parameters returns the cell's parameters.
+func (c *GRUCell) Parameters() []*tensor.Tensor {
+	return append(c.Wih.Parameters(), c.Whh.Parameters()...)
+}
+
 // sliceTime returns x[:, t, :] for a (B, T, F) tensor as (B, F).
 // Implemented as a gather-style matmul so autograd is preserved.
 func sliceTime(x *tensor.Tensor, t int) *tensor.Tensor {
