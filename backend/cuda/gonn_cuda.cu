@@ -13,6 +13,7 @@
 #include "gonn_cuda.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 #include <stdio.h>
 
@@ -653,6 +654,104 @@ extern "C" double gonn_bench_add_dev(int n, int iters, int f32) {
     cudaEventSynchronize(e);
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, s, e);
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    return (double)ms / iters;
+}
+
+// ===========================================================================
+// Device-resident buffers: allocate once on the GPU, run a chain of ops, copy
+// back once. Eliminates the per-call H2D/D2H that the eager backend pays.
+// Pointers are returned to Go as void* (unsafe.Pointer). f64 path + an fp16
+// tensor-core GEMM path (cublasGemmEx) for tensor-core throughput.
+// ===========================================================================
+
+extern "C" void* gonn_dev_alloc(long bytes) {
+    void* p = nullptr;
+    if (cudaMalloc(&p, (size_t)bytes) != cudaSuccess) return nullptr;
+    return p;
+}
+extern "C" void gonn_dev_free(void* p) { if (p) cudaFree(p); }
+extern "C" void gonn_dev_upload(void* dst, const double* src, long n) {
+    cudaMemcpy(dst, src, sizeof(double) * (size_t)n, cudaMemcpyHostToDevice);
+}
+extern "C" void gonn_dev_download(double* dst, const void* src, long n) {
+    cudaMemcpy(dst, src, sizeof(double) * (size_t)n, cudaMemcpyDeviceToHost);
+}
+extern "C" void gonn_dev_sync(void) { cudaDeviceSynchronize(); }
+
+// C(m,n) = A(m,k) * B(k,n), all device-resident f64. (cuBLAS column-major trick.)
+extern "C" void gonn_dev_matmul_f64(const void* dA, const void* dB, void* dC, int m, int k, int n) {
+    ensure_handle();
+    const double alpha = 1.0, beta = 0.0;
+    cublasDgemm(g_handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
+                &alpha, (const double*)dB, n, (const double*)dA, k,
+                &beta, (double*)dC, n);
+}
+extern "C" void gonn_dev_add_f64(const void* dA, const void* dB, void* dC, int n) {
+    int t = 256, b = (n + t - 1) / t;
+    add_kernel<<<b, t>>>((const double*)dA, (const double*)dB, (double*)dC, n);
+}
+extern "C" void gonn_dev_relu_f64(void* dA, int n) {
+    int t = 256, b = (n + t - 1) / t;
+    relu_kernel<<<b, t>>>((const double*)dA, (double*)dA, n); // in place
+}
+
+// ---- fp16 tensor-core path -------------------------------------------------
+__global__ void d2h_kernel(const double* in, __half* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __double2half(in[i]);
+}
+__global__ void h2d_kernel(const __half* in, double* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = (double)__half2float(in[i]);
+}
+
+// Allocate n halfs and fill from host doubles (converted on device).
+extern "C" void* gonn_dev_upload_f16(const double* src, int n) {
+    void* dHalf = nullptr;
+    if (cudaMalloc(&dHalf, sizeof(__half) * (size_t)n) != cudaSuccess) return nullptr;
+    double* tmp = nullptr;
+    cudaMalloc(&tmp, sizeof(double) * (size_t)n);
+    cudaMemcpy(tmp, src, sizeof(double) * (size_t)n, cudaMemcpyHostToDevice);
+    int t = 256, b = (n + t - 1) / t;
+    d2h_kernel<<<b, t>>>(tmp, (__half*)dHalf, n);
+    cudaFree(tmp);
+    return dHalf;
+}
+extern "C" void gonn_dev_download_f16(double* dst, const void* dHalf, int n) {
+    double* tmp = nullptr;
+    cudaMalloc(&tmp, sizeof(double) * (size_t)n);
+    int t = 256, b = (n + t - 1) / t;
+    h2d_kernel<<<b, t>>>((const __half*)dHalf, tmp, n);
+    cudaMemcpy(dst, tmp, sizeof(double) * (size_t)n, cudaMemcpyDeviceToHost);
+    cudaFree(tmp);
+}
+// fp16 GEMM with f32 accumulate on tensor cores. half in/out, device-resident.
+extern "C" void gonn_dev_matmul_f16(const void* dA, const void* dB, void* dC, int m, int k, int n) {
+    ensure_handle();
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(g_handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
+                 &alpha, dB, CUDA_R_16F, n, dA, CUDA_R_16F, k,
+                 &beta, dC, CUDA_R_16F, n,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+// Device-resident fp16 tensor-core GEMM benchmark; returns avg ms/iter.
+extern "C" double gonn_bench_matmul_f16_dev(int m, int k, int n, int iters) {
+    void *dA, *dB, *dC;
+    if (cudaMalloc(&dA, sizeof(__half) * (size_t)m * k) != cudaSuccess) return -1.0;
+    if (cudaMalloc(&dB, sizeof(__half) * (size_t)k * n) != cudaSuccess) { cudaFree(dA); return -1.0; }
+    if (cudaMalloc(&dC, sizeof(__half) * (size_t)m * n) != cudaSuccess) { cudaFree(dA); cudaFree(dB); return -1.0; }
+    cudaMemset(dA, 0, sizeof(__half) * (size_t)m * k);
+    cudaMemset(dB, 0, sizeof(__half) * (size_t)k * n);
+    for (int i = 0; i < 5; i++) gonn_dev_matmul_f16(dA, dB, dC, m, k, n);
+    cudaDeviceSynchronize();
+    cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+    cudaEventRecord(s);
+    for (int i = 0; i < iters; i++) gonn_dev_matmul_f16(dA, dB, dC, m, k, n);
+    cudaEventRecord(e); cudaEventSynchronize(e);
+    float ms = 0.0f; cudaEventElapsedTime(&ms, s, e);
     cudaEventDestroy(s); cudaEventDestroy(e);
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
     return (double)ms / iters;

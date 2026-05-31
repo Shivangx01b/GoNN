@@ -75,6 +75,21 @@ void gonn_flash_attn_f64_bwd(const double* Q, const double* K, const double* V,
                              double* dQ, double* dK, double* dV,
                              int BH, int S, int d, double scale, int causal);
 
+// --- Device-resident buffers (allocate once, chain ops, copy back once) -----
+void* gonn_dev_alloc(long bytes);
+void  gonn_dev_free(void* p);
+void  gonn_dev_upload(void* dst, const double* src, long n);
+void  gonn_dev_download(double* dst, const void* src, long n);
+void  gonn_dev_sync(void);
+void  gonn_dev_matmul_f64(const void* dA, const void* dB, void* dC, int m, int k, int n);
+void  gonn_dev_add_f64(const void* dA, const void* dB, void* dC, int n);
+void  gonn_dev_relu_f64(void* dA, int n);
+// fp16 tensor-core path
+void* gonn_dev_upload_f16(const double* src, int n);      // returns device __half buffer
+void  gonn_dev_download_f16(double* dst, const void* dHalf, int n);
+void  gonn_dev_matmul_f16(const void* dA, const void* dB, void* dC, int m, int k, int n);
+double gonn_bench_matmul_f16_dev(int m, int k, int n, int iters);
+
 #ifdef __cplusplus
 }
 #endif

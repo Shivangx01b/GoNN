@@ -45,4 +45,7 @@ go run -tags cuda ./benchmark/mha
 echo "=== 8. Fused attention BACKWARD: gradcheck + MHA training ==="
 go run -tags cuda ./benchmark/flashbwd
 
+echo "=== 9. Device-resident buffers (MLP) + fp16 tensor-core GEMM ==="
+go run -tags cuda ./benchmark/resident
+
 echo "=== done ==="

@@ -149,6 +149,25 @@ docker run --rm --gpus all -v "$PWD":/work -w /work gonn-cuda \
 python benchmark/aggregate.py            # -> RESULTS.md
 ```
 
+## Device-resident buffers + fp16 tensor cores
+
+`backend/cuda` now exposes a device-buffer API (`DevAlloc`/`DevUpload`/`Download`/
+`Free` + `DevMatMul`/`DevAdd`/`DevReLU`, and an fp16 `DeviceBufferF16` +
+`DevMatMulF16`). Allocate once, chain ops on-device, copy back once — removing the
+per-call H2D/D2H the eager backend pays. Verified live:
+
+| measurement | result |
+|---|---|
+| MLP forward (256×1024³, 3 matmuls): resident vs eager | **2.0× faster** (10.7 ms → ... eager 21.4 ms); resident == eager **maxAbsDiff 0** |
+| matmul N=2048 **f64** (resident) | 179 GFLOP/s |
+| matmul N=2048 **f32** (resident) | 8,149 GFLOP/s |
+| matmul N=2048 **fp16 tensor core** (cublasGemmEx) | **24,464 GFLOP/s** |
+
+fp16 on tensor cores is **3× over f32, 137× over f64**, and ~3× PyTorch's fp32
+(~7,600). This is the dtype/tensor-core unlock — exposed on the GPU resident path.
+(A *host-wide* fp16/fp32 tensor dtype across all ~90 files is a separate large
+refactor; this delivers the practical GPU-compute value of it.)
+
 ## Honest bottom line
 - **Fused causal fp64 attention: GoNN BEATS PyTorch ~1.5×** — a real win on the
   attention pattern LLM decoders use, from a custom kernel that exploits

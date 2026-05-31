@@ -280,6 +280,94 @@ func BenchFlashAttnF64(BH, S, d, iters int, causal bool) float64 {
 	return float64(C.gonn_bench_flash_attn_f64(C.int(BH), C.int(S), C.int(d), C.int(iters), c))
 }
 
+// DeviceBuffer is an opaque handle to a device (GPU) allocation of float64
+// elements. Allocate once, run a chain of device ops, Download once — avoiding
+// the per-call host<->device copies the eager backend pays. Free when done.
+type DeviceBuffer struct {
+	ptr unsafe.Pointer
+	n   int
+}
+
+// DevAlloc allocates n float64 elements on the device (uninitialized).
+func DevAlloc(n int) DeviceBuffer {
+	return DeviceBuffer{ptr: unsafe.Pointer(C.gonn_dev_alloc(C.long(n) * 8)), n: n}
+}
+
+// DevUpload copies a host slice to a new device buffer.
+func DevUpload(host []float64) DeviceBuffer {
+	b := DevAlloc(len(host))
+	if len(host) > 0 {
+		C.gonn_dev_upload(b.ptr, (*C.double)(unsafe.Pointer(&host[0])), C.long(len(host)))
+	}
+	return b
+}
+
+// Download copies the device buffer back to a fresh host slice.
+func (b DeviceBuffer) Download() []float64 {
+	out := make([]float64, b.n)
+	if b.n > 0 {
+		C.gonn_dev_download((*C.double)(unsafe.Pointer(&out[0])), b.ptr, C.long(b.n))
+	}
+	return out
+}
+
+// Free releases the device allocation.
+func (b DeviceBuffer) Free() { C.gonn_dev_free(b.ptr) }
+
+// DevSync blocks until queued device work completes.
+func DevSync() { C.gonn_dev_sync() }
+
+// DevMatMul computes C(m,n) = A(m,k) * B(k,n) on resident buffers (no copies).
+func DevMatMul(a, b, c DeviceBuffer, m, k, n int) {
+	C.gonn_dev_matmul_f64(a.ptr, b.ptr, c.ptr, C.int(m), C.int(k), C.int(n))
+}
+
+// DevAdd computes C = A + B on resident buffers.
+func DevAdd(a, b, c DeviceBuffer, n int) { C.gonn_dev_add_f64(a.ptr, b.ptr, c.ptr, C.int(n)) }
+
+// DevReLU applies ReLU in place on a resident buffer.
+func DevReLU(a DeviceBuffer, n int) { C.gonn_dev_relu_f64(a.ptr, C.int(n)) }
+
+// DeviceBufferF16 is a device buffer of fp16 (__half) elements for the
+// tensor-core GEMM path. Created from host float64 (converted on device).
+type DeviceBufferF16 struct {
+	ptr unsafe.Pointer
+	n   int
+}
+
+// DevAllocF16 allocates n fp16 elements on the device.
+func DevAllocF16(n int) DeviceBufferF16 {
+	return DeviceBufferF16{ptr: unsafe.Pointer(C.gonn_dev_alloc(C.long(n) * 2)), n: n}
+}
+
+// DevUploadF16 uploads host float64 data as fp16 (converted on device).
+func DevUploadF16(host []float64) DeviceBufferF16 {
+	p := C.gonn_dev_upload_f16((*C.double)(unsafe.Pointer(&host[0])), C.int(len(host)))
+	return DeviceBufferF16{ptr: unsafe.Pointer(p), n: len(host)}
+}
+
+// Download converts the fp16 buffer back to host float64.
+func (b DeviceBufferF16) Download() []float64 {
+	out := make([]float64, b.n)
+	if b.n > 0 {
+		C.gonn_dev_download_f16((*C.double)(unsafe.Pointer(&out[0])), b.ptr, C.int(b.n))
+	}
+	return out
+}
+
+// Free releases the fp16 device allocation.
+func (b DeviceBufferF16) Free() { C.gonn_dev_free(b.ptr) }
+
+// DevMatMulF16 computes C = A*B in fp16 on tensor cores (f32 accumulate).
+func DevMatMulF16(a, b, c DeviceBufferF16, m, k, n int) {
+	C.gonn_dev_matmul_f16(a.ptr, b.ptr, c.ptr, C.int(m), C.int(k), C.int(n))
+}
+
+// BenchMatMulF16Dev benchmarks the device-resident fp16 tensor-core GEMM.
+func BenchMatMulF16Dev(m, k, n, iters int) float64 {
+	return float64(C.gonn_bench_matmul_f16_dev(C.int(m), C.int(k), C.int(n), C.int(iters)))
+}
+
 // Backend returns the live CUDA backend.
 func Backend() (backend.Backend, error) { return cudaBackend{}, nil }
 
