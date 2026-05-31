@@ -39,7 +39,7 @@ GoNN is a single-binary, dependency-light alternative to PyTorch / tinygrad / Te
   - **Metrics + model selection:** Accuracy, Precision/Recall/F1, ConfusionMatrix, MSE/MAE/R²/SilhouetteScore/ROCAUC, TrainTestSplit, KFold, CrossValScore.
 - **`data` package** — `Dataset`, `DataLoader`, transforms, MNIST/CSV loaders, synthetic dataset generators (`MakeRegression`, `MakeClassification`, `MakeBlobs`, `MakeMoons`).
 - **`backend` package** — pluggable compute backend. The CPU backend uses gonum's BLAS for matmul; the CUDA backend (`-tags cuda`, CGO + cuBLAS) is wired into `tensor.MatMul`, so real models run their GEMMs on the GPU. Verified on an RTX 3060 and benchmarked against PyTorch / TensorFlow / tinygrad (see [Benchmarks](#benchmarks)).
-- **Fused CUDA flash-attention** — a custom fp64 flash-attention kernel (online softmax, no S×S materialization) wired into `nn.MultiHeadAttention.ForwardFused`. On **causal** fp64 attention it is **~1.4–1.5× faster than PyTorch's SDPA**.
+- **Fused CUDA flash-attention (forward + backward)** — a custom fp64 flash-attention kernel (online softmax, no S×S materialization) wired into `nn.MultiHeadAttention`. On **causal** fp64 attention it is **~1.4–1.5× faster than PyTorch's SDPA**, and its fused backward (gradcheck ≈ 5e-8) lets the differentiable `Forward` **train** on the kernel — not just run inference.
 
 Everything compiles to a single static Go binary (no Python runtime).
 
@@ -206,7 +206,7 @@ and tables: [`benchmark/REPORT.md`](benchmark/REPORT.md) and
 | **causal attention f64** (GFLOP/s) | **~87–96** | 58–66 | — | **GoNN wins ~1.4–1.5×** (fused kernel) |
 | matmul f32 GPU (GFLOP/s) | **~7,700–8,150** | ~7,600 | 1,104 (OpenCL) | GoNN ≈ PyTorch; ~7× tinygrad |
 | matmul f64 GPU (GFLOP/s) | **~170–179** | ~174 | 176 | three-way tie (all cuBLAS) |
-| `MHA.ForwardFused` vs `Forward` | **5–6× faster**, maxAbsDiff ≈ 2e-16 | — | — | inference path |
+| fused attention in `nn.MultiHeadAttention` | trains (gradcheck ≈5e-8) + inference on GPU | — | — | fwd+bwd kernel |
 | matmul f64 CPU (GFLOP/s) | 40 (gonum) | **166** (MKL) | — | PyTorch (MKL) |
 
 **Honest summary:** GoNN's GPU matmul is on par with PyTorch (both lean on

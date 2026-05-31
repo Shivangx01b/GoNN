@@ -72,41 +72,26 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ---- speed: Forward vs ForwardFused (modest size so the regular path,
-	// whose selector-based batched matmul materializes ~B*H full (S,S) tensors
-	// in the autograd graph, does not exhaust memory) ----
-	fmt.Println("=== MHA speed: Forward vs ForwardFused (B=2, S=256, E=512, H=8, causal) ===")
-	x := randT(2, 256, E)
+	// ---- speed: on a CUDA build, BOTH Forward (differentiable, training-capable)
+	// and ForwardFused (inference-only) now run the GPU fused-attention core, so
+	// they are comparable. Both handle B=8,S=512 — a size the previous
+	// selector-based batched-matmul core could not (it materialized ~B*H full
+	// (S,S) tensors in the autograd graph and OOM'd). ----
 	const iters = 10
-
 	durs := make([]time.Duration, iters)
-	for i := 0; i < 2; i++ {
-		mha.Forward(x, x, x, true)
-	}
-	for i := 0; i < iters; i++ {
-		t0 := time.Now()
-		mha.Forward(x, x, x, true)
-		durs[i] = time.Since(t0)
-	}
-	regMs := median(durs)
 
-	for i := 0; i < 3; i++ {
-		mha.ForwardFused(x, x, x, true)
-	}
-	for i := 0; i < iters; i++ {
-		t0 := time.Now()
-		mha.ForwardFused(x, x, x, true)
-		durs[i] = time.Since(t0)
-	}
-	fusedMs := median(durs)
-
-	fmt.Printf("  Forward       (autograd, batched-matmul core): %8.3f ms\n", regMs)
-	fmt.Printf("  ForwardFused  (fused GPU flash-attn core):      %8.3f ms\n", fusedMs)
-	fmt.Printf("  speedup: %.1fx\n", regMs/fusedMs)
-
-	// fused-only at a larger size the regular path cannot handle (OOM).
-	fmt.Println("=== ForwardFused at B=8, S=512 (regular Forward OOMs here) ===")
+	fmt.Println("=== MHA speed, B=8, S=512, E=512, H=8, causal (both fused on GPU) ===")
 	xl := randT(8, 512, E)
+	for i := 0; i < 2; i++ {
+		mha.Forward(xl, xl, xl, true)
+	}
+	for i := 0; i < iters; i++ {
+		t0 := time.Now()
+		mha.Forward(xl, xl, xl, true)
+		durs[i] = time.Since(t0)
+	}
+	fmt.Printf("  Forward      (differentiable fused core, trains): %8.3f ms\n", median(durs))
+
 	for i := 0; i < 3; i++ {
 		mha.ForwardFused(xl, xl, xl, true)
 	}
@@ -115,5 +100,5 @@ func main() {
 		mha.ForwardFused(xl, xl, xl, true)
 		durs[i] = time.Since(t0)
 	}
-	fmt.Printf("  ForwardFused B=8,S=512 causal: %.3f ms/call\n", median(durs))
+	fmt.Printf("  ForwardFused (inference-only fused core):         %8.3f ms\n", median(durs))
 }

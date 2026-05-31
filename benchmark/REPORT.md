@@ -70,28 +70,38 @@ no tensor cores. Honest: GoNN does not beat fp16/fp32 FlashAttention.
 
 ## Wired into the model: `MultiHeadAttention.ForwardFused`
 
-The fused kernel is now usable from GoNN's actual attention layer
-(`nn/attention.go`). `ForwardFused(q,k,v,causal)` projects Q/K/V, runs the
-scaled-dot-product **core** through the GPU flash-attention kernel (one launch,
-no S×S materialization), then applies the output projection. It transparently
-falls back to the differentiable `Forward` when the kernel is unavailable
-(non-cuda build), `HeadDim != 64`, or `Tq != Tk`. It is **inference-only** (no
-autograd through the fused core).
+The fused kernel is wired into GoNN's actual attention layer (`nn/attention.go`)
+for **both training and inference**, and falls back to the differentiable
+`batchedMatMul` core on non-cuda builds, `HeadDim != 64`, or `Tq != Tk`.
+
+**Forward + backward (training).** The forward saves the per-row log-sum-exp
+`L`; a fused backward kernel (`flash_attn_bwd_f64_kernel`, fp64 `atomicAdd` for
+dK/dV) computes dQ/dK/dV via the standard FlashAttention backward identities,
+hooked into GoNN's autograd through a custom node (`tensor.MakeNode`). So on a
+`-tags cuda` build the **regular differentiable** `MultiHeadAttention.Forward`
+runs the whole attention core (fwd *and* bwd) on the GPU.
+
+**Inference.** `ForwardFused` is a lighter inference-only variant (skips `L`).
 
 Verified live (E=512, H=8 → head dim 64):
 
 | check | result |
 |---|---|
-| `ForwardFused` vs `Forward` output | **maxAbsDiff ≈ 2e-16** (numerically identical) |
-| speed B=2, S=256, causal | `Forward` 313 ms → `ForwardFused` **63 ms (5.0×)** |
-| B=8, S=512, causal | `ForwardFused` 425 ms/call — regular `Forward` **OOMs** here |
+| backward gradcheck (finite-diff, dQ/dK/dV) | **maxRelErr ≈ 5e-8**, causal and non-causal |
+| MHA training loop (Adam, fused fwd+bwd) | loss **1.03 → 0.12** in 30 steps |
+| `ForwardFused` vs `Forward` output | **maxAbsDiff ≈ 2e-16** (identical) |
+| B=8, S=512, causal | both run on GPU; the **previous** selector-matmul core OOM'd here |
 
-The 5× is partly because GoNN's old `batchedMatMul` core is a selector-matmul
-loop that materializes ~B·H full (S,S) tensors in the autograd graph (hence the
-OOM at B=8,S=512); the fused kernel sidesteps all of it. `ForwardFused` still
-pays per-call H2D/D2H inside the kernel and runs Q/K/V/out projections on the
-CPU (gonum), so it is not yet at the raw-kernel ceiling — device-resident
-buffers + GPU projections are the remaining wins.
+Because `Forward` now *is* the fused path on GPU, `Forward` and `ForwardFused`
+run at comparable speed (both kernel-bound); the old selector-matmul core — which
+materialized ~B·H full (S,S) tensors in the autograd graph and was ~5× slower /
+OOM-prone — is now only the CPU/non-cuda fallback. The fused path still pays
+per-call H2D/D2H and runs the Q/K/V/out projections on CPU (gonum), so it is not
+yet at the raw-kernel ceiling — device-resident buffers + GPU projections remain.
+
+**Bottom line: GoNN's custom fp64 flash-attention kernel now powers both
+training and inference of `MultiHeadAttention`, on the same path that beats
+PyTorch ~1.5× on causal attention.**
 
 ## CPU — matmul (float64)
 GoNN's CPU matmul went **2.4 → 40 GFLOP/s (17×)** by switching the backend from a
@@ -144,9 +154,11 @@ python benchmark/aggregate.py            # -> RESULTS.md
   attention pattern LLM decoders use, from a custom kernel that exploits
   causality and skips S×S materialization. (Non-causal fp64 loses ~25%; fp16/f32
   FlashAttention is out of reach.)
-- **The kernel is wired into `nn.MultiHeadAttention.ForwardFused`** — bit-identical
-  to the autograd `Forward` (maxAbsDiff ≈ 2e-16), **5× faster** for inference, and
-  runs at sizes where the old path OOMs. Models can use it today for generation.
+- **The kernel is wired into `nn.MultiHeadAttention`** — `ForwardFused` for
+  inference (bit-identical to `Forward`, maxAbsDiff ≈ 2e-16, **5× faster**), and a
+  **fused backward** so the regular differentiable `Forward` **trains** on the
+  kernel (gradcheck maxRelErr ≈ 5e-8; an MHA trains, loss 1.03 → 0.12). The custom
+  kernel is now usable for both training and generation.
 - **GPU matmul (f32 & f64): GoNN is on par with PyTorch** and faster than
   tinygrad-on-OpenCL — all three lean on cuBLAS; GoNN's wrapper is lean. GoNN
   went from *no working GPU backend* to *PyTorch-class GPU matmul*.
@@ -159,9 +171,12 @@ python benchmark/aggregate.py            # -> RESULTS.md
   improved its CPU path.
 
 ### Still open (to pull further ahead)
-- **Tensor-core / tiled fp32 attention** to challenge FlashAttention-2.
+- **Tensor-core (WMMA) fp16/tf32 attention** to challenge FlashAttention-2 —
+  research-grade; FA2 is heavily hand-tuned, so beating it from scratch is a long
+  shot. A from-scratch WMMA kernel would more likely *tie or lose*; honest about that.
 - **Device-resident tensor buffers** so the real tensor-op path (not just the
-  benchmark) avoids per-call H2D/D2H — collapses `gonn (cuda)` into `gonn-resident`.
+  benchmark) avoids per-call H2D/D2H — collapses `gonn (cuda)` into `gonn-resident`,
+  and removes the H2D/D2H inside the fused attention fwd/bwd.
 - **A real FP32 tensor dtype** end-to-end (f32 currently exists only in the GPU
   GEMM/attention kernels; tensors are f64).
 - **cgo OpenBLAS/MKL CPU backend** to reach MKL-class CPU throughput.

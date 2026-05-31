@@ -226,6 +226,50 @@ func FlashAttnF64(Q, K, V, O []float64, BH, S, d int, scale float64, causal bool
 	)
 }
 
+// FlashAttnF64Fwd runs the training forward, returning O and L (logsumexp per
+// query row, length BH*S) for the backward pass. Q,K,V are flat (BH,S,d).
+func FlashAttnF64Fwd(Q, K, V []float64, BH, S, d int, scale float64, causal bool) (O, L []float64) {
+	O = make([]float64, len(Q))
+	L = make([]float64, BH*S)
+	var c C.int
+	if causal {
+		c = 1
+	}
+	C.gonn_flash_attn_f64_fwd(
+		(*C.double)(unsafe.Pointer(&Q[0])),
+		(*C.double)(unsafe.Pointer(&K[0])),
+		(*C.double)(unsafe.Pointer(&V[0])),
+		(*C.double)(unsafe.Pointer(&O[0])),
+		(*C.double)(unsafe.Pointer(&L[0])),
+		C.int(BH), C.int(S), C.int(d), C.double(scale), c,
+	)
+	return O, L
+}
+
+// FlashAttnF64Bwd computes dQ,dK,dV from the saved forward tensors and dO.
+func FlashAttnF64Bwd(Q, K, V, O, L, dO []float64, BH, S, d int, scale float64, causal bool) (dQ, dK, dV []float64) {
+	dQ = make([]float64, len(Q))
+	dK = make([]float64, len(K))
+	dV = make([]float64, len(V))
+	var c C.int
+	if causal {
+		c = 1
+	}
+	C.gonn_flash_attn_f64_bwd(
+		(*C.double)(unsafe.Pointer(&Q[0])),
+		(*C.double)(unsafe.Pointer(&K[0])),
+		(*C.double)(unsafe.Pointer(&V[0])),
+		(*C.double)(unsafe.Pointer(&O[0])),
+		(*C.double)(unsafe.Pointer(&L[0])),
+		(*C.double)(unsafe.Pointer(&dO[0])),
+		(*C.double)(unsafe.Pointer(&dQ[0])),
+		(*C.double)(unsafe.Pointer(&dK[0])),
+		(*C.double)(unsafe.Pointer(&dV[0])),
+		C.int(BH), C.int(S), C.int(d), C.double(scale), c,
+	)
+	return dQ, dK, dV
+}
+
 // BenchFlashAttnF64 runs the device-resident, CUDA-event-timed flash-attention
 // benchmark and returns average ms/iter.
 func BenchFlashAttnF64(BH, S, d, iters int, causal bool) float64 {

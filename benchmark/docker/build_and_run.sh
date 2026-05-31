@@ -10,7 +10,8 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 echo "=== 1. Compile CUDA kernels -> libgonn_cuda.so ==="
 cd backend/cuda
-nvcc -O3 -Xcompiler -fPIC -shared gonn_cuda.cu -o libgonn_cuda.so -lcublas
+# -arch=sm_86 (RTX 3060): fp64 atomicAdd needs sm_60+; sm_86 matches the GPU.
+nvcc -O3 -arch=sm_86 -Xcompiler -fPIC -shared gonn_cuda.cu -o libgonn_cuda.so -lcublas
 ls -la libgonn_cuda.so
 cd /work
 
@@ -40,5 +41,8 @@ go run -tags cuda ./benchmark/flashattn
 
 echo "=== 7. MultiHeadAttention.ForwardFused: correctness + speedup vs Forward ==="
 go run -tags cuda ./benchmark/mha
+
+echo "=== 8. Fused attention BACKWARD: gradcheck + MHA training ==="
+go run -tags cuda ./benchmark/flashbwd
 
 echo "=== done ==="

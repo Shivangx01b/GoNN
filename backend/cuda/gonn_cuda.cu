@@ -367,7 +367,7 @@ extern "C" double gonn_bench_matmul_dev(int m, int k, int n, int iters, int f32)
 // ---------------------------------------------------------------------------
 // Generic fallback (one thread per query row) for d != 64.
 __global__ void flash_attn_f64_kernel(const double* Q, const double* K, const double* V,
-                                      double* O, int BH, int S, int d, double scale, int causal) {
+                                      double* O, double* L, int BH, int S, int d, double scale, int causal) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= BH * S) return;
     int bh = row / S, i = row % S;
@@ -394,6 +394,59 @@ __global__ void flash_attn_f64_kernel(const double* Q, const double* K, const do
     }
     double inv = 1.0 / l;
     for (int t = 0; t < d; t++) o[t] = acc[t] * inv;
+    if (L) L[row] = m + log(l);
+}
+
+// Backward: given Q,K,V,O,L (from forward) and dO, accumulate dQ,dK,dV.
+// One thread per query row; dQ is race-free per row, dK/dV use fp64 atomicAdd
+// (sm_60+). Uses the standard FlashAttention backward identities:
+//   p_ij   = exp(scale*q_i.k_j - L_i)
+//   D_i    = dO_i . O_i
+//   dV_j  += p_ij * dO_i
+//   dS_ij  = p_ij * ((dO_i.v_j) - D_i) * scale
+//   dQ_i  += dS_ij * k_j ;  dK_j += dS_ij * q_i
+__global__ void flash_attn_bwd_f64_kernel(
+        const double* Q, const double* K, const double* V,
+        const double* O, const double* L, const double* dO,
+        double* dQ, double* dK, double* dV,
+        int BH, int S, int d, double scale, int causal) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= BH * S) return;
+    int bh = row / S, i = row % S;
+    const double* q   = Q  + (size_t)row * d;
+    const double* dOi = dO + (size_t)row * d;
+    const double* Oi  = O  + (size_t)row * d;
+    const double* Kb  = K  + (size_t)(bh * S) * d;
+    const double* Vb  = V  + (size_t)(bh * S) * d;
+    double* dKb = dK + (size_t)(bh * S) * d;
+    double* dVb = dV + (size_t)(bh * S) * d;
+    double* dq  = dQ + (size_t)row * d;
+
+    double Li = L[row];
+    double ql[128], dol[128], dqloc[128];
+    double Di = 0.0;
+    for (int t = 0; t < d; t++) {
+        ql[t] = q[t];
+        dol[t] = dOi[t];
+        dqloc[t] = 0.0;
+        Di += dOi[t] * Oi[t];
+    }
+
+    int jmax = causal ? (i + 1) : S;
+    for (int j = 0; j < jmax; j++) {
+        const double* k = Kb + (size_t)j * d;
+        const double* v = Vb + (size_t)j * d;
+        double s = 0.0, dp = 0.0;
+        for (int t = 0; t < d; t++) { s += ql[t] * k[t]; dp += dol[t] * v[t]; }
+        double p = exp(s * scale - Li);
+        double ds = p * (dp - Di) * scale;
+        for (int t = 0; t < d; t++) {
+            atomicAdd(&dVb[(size_t)j * d + t], p * dol[t]);
+            dqloc[t] += ds * k[t];
+            atomicAdd(&dKb[(size_t)j * d + t], ds * ql[t]);
+        }
+    }
+    for (int t = 0; t < d; t++) dq[t] = dqloc[t];
 }
 
 // Tiled flash attention (d == 64): a block of TILE_Q queries from the same
@@ -403,7 +456,7 @@ __global__ void flash_attn_f64_kernel(const double* Q, const double* K, const do
 #define TILE_Q 64
 #define TILE_K 16
 __global__ void flash_attn_f64_tiled(const double* Q, const double* K, const double* V,
-                                     double* O, int BH, int S, double scale, int causal) {
+                                     double* O, double* L, int BH, int S, double scale, int causal) {
     const int d = 64;
     int bh = blockIdx.y;
     int q0 = blockIdx.x * TILE_Q;
@@ -459,18 +512,20 @@ __global__ void flash_attn_f64_tiled(const double* Q, const double* K, const dou
         double inv = 1.0 / l;
         double* o = O + (size_t)(bh * S + i) * d;
         for (int t = 0; t < d; t++) o[t] = acc[t] * inv;
+        if (L) L[(size_t)bh * S + i] = m + log(l); // logsumexp, saved for backward
     }
 }
 
 // Launch helper: pick the tiled kernel for d == 64, else the generic fallback.
+// L (logsumexp per query row, BH*S) may be null when not needed (inference).
 static void launch_flash_f64(const double* Q, const double* K, const double* V, double* O,
-                             int BH, int S, int d, double scale, int causal) {
+                             double* L, int BH, int S, int d, double scale, int causal) {
     if (d == 64) {
         dim3 grid((S + TILE_Q - 1) / TILE_Q, BH);
-        flash_attn_f64_tiled<<<grid, TILE_Q>>>(Q, K, V, O, BH, S, scale, causal);
+        flash_attn_f64_tiled<<<grid, TILE_Q>>>(Q, K, V, O, L, BH, S, scale, causal);
     } else {
         int threads = 128, blocks = (BH * S + threads - 1) / threads;
-        flash_attn_f64_kernel<<<blocks, threads>>>(Q, K, V, O, BH, S, d, scale, causal);
+        flash_attn_f64_kernel<<<blocks, threads>>>(Q, K, V, O, L, BH, S, d, scale, causal);
     }
 }
 
@@ -486,9 +541,58 @@ extern "C" void gonn_flash_attn_f64(const double* Q, const double* K, const doub
     cudaMemcpy(dQ, Q, sizeof(double) * qn, cudaMemcpyHostToDevice);
     cudaMemcpy(dK, K, sizeof(double) * qn, cudaMemcpyHostToDevice);
     cudaMemcpy(dV, V, sizeof(double) * qn, cudaMemcpyHostToDevice);
-    launch_flash_f64(dQ, dK, dV, dO, BH, S, d, scale, causal);
+    launch_flash_f64(dQ, dK, dV, dO, nullptr, BH, S, d, scale, causal);
     cudaMemcpy(O, dO, sizeof(double) * qn, cudaMemcpyDeviceToHost);
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+}
+
+// Training forward: also returns L (logsumexp per query row, BH*S) for backward.
+extern "C" void gonn_flash_attn_f64_fwd(const double* Q, const double* K, const double* V,
+                                        double* O, double* L, int BH, int S, int d,
+                                        double scale, int causal) {
+    size_t qn = (size_t)BH * S * d, ln = (size_t)BH * S;
+    double *dQ, *dK, *dV, *dO, *dL;
+    cudaMalloc(&dQ, sizeof(double) * qn); cudaMalloc(&dK, sizeof(double) * qn);
+    cudaMalloc(&dV, sizeof(double) * qn); cudaMalloc(&dO, sizeof(double) * qn);
+    cudaMalloc(&dL, sizeof(double) * ln);
+    cudaMemcpy(dQ, Q, sizeof(double) * qn, cudaMemcpyHostToDevice);
+    cudaMemcpy(dK, K, sizeof(double) * qn, cudaMemcpyHostToDevice);
+    cudaMemcpy(dV, V, sizeof(double) * qn, cudaMemcpyHostToDevice);
+    launch_flash_f64(dQ, dK, dV, dO, dL, BH, S, d, scale, causal);
+    cudaMemcpy(O, dO, sizeof(double) * qn, cudaMemcpyDeviceToHost);
+    cudaMemcpy(L, dL, sizeof(double) * ln, cudaMemcpyDeviceToHost);
+    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO); cudaFree(dL);
+}
+
+// Backward: compute dQ,dK,dV from Q,K,V,O,L,dO.
+extern "C" void gonn_flash_attn_f64_bwd(const double* Q, const double* K, const double* V,
+                                        const double* O, const double* L, const double* dO,
+                                        double* dQ, double* dK, double* dV,
+                                        int BH, int S, int d, double scale, int causal) {
+    size_t qn = (size_t)BH * S * d, ln = (size_t)BH * S;
+    double *Qd, *Kd, *Vd, *Od, *Ld, *dOd, *dQd, *dKd, *dVd;
+    cudaMalloc(&Qd, sizeof(double) * qn); cudaMalloc(&Kd, sizeof(double) * qn);
+    cudaMalloc(&Vd, sizeof(double) * qn); cudaMalloc(&Od, sizeof(double) * qn);
+    cudaMalloc(&Ld, sizeof(double) * ln); cudaMalloc(&dOd, sizeof(double) * qn);
+    cudaMalloc(&dQd, sizeof(double) * qn); cudaMalloc(&dKd, sizeof(double) * qn);
+    cudaMalloc(&dVd, sizeof(double) * qn);
+    cudaMemcpy(Qd, Q, sizeof(double) * qn, cudaMemcpyHostToDevice);
+    cudaMemcpy(Kd, K, sizeof(double) * qn, cudaMemcpyHostToDevice);
+    cudaMemcpy(Vd, V, sizeof(double) * qn, cudaMemcpyHostToDevice);
+    cudaMemcpy(Od, O, sizeof(double) * qn, cudaMemcpyHostToDevice);
+    cudaMemcpy(Ld, L, sizeof(double) * ln, cudaMemcpyHostToDevice);
+    cudaMemcpy(dOd, dO, sizeof(double) * qn, cudaMemcpyHostToDevice);
+    cudaMemset(dQd, 0, sizeof(double) * qn);
+    cudaMemset(dKd, 0, sizeof(double) * qn);
+    cudaMemset(dVd, 0, sizeof(double) * qn);
+    int threads = 128, blocks = (BH * S + threads - 1) / threads;
+    flash_attn_bwd_f64_kernel<<<blocks, threads>>>(Qd, Kd, Vd, Od, Ld, dOd,
+                                                   dQd, dKd, dVd, BH, S, d, scale, causal);
+    cudaMemcpy(dQ, dQd, sizeof(double) * qn, cudaMemcpyDeviceToHost);
+    cudaMemcpy(dK, dKd, sizeof(double) * qn, cudaMemcpyDeviceToHost);
+    cudaMemcpy(dV, dVd, sizeof(double) * qn, cudaMemcpyDeviceToHost);
+    cudaFree(Qd); cudaFree(Kd); cudaFree(Vd); cudaFree(Od); cudaFree(Ld);
+    cudaFree(dOd); cudaFree(dQd); cudaFree(dKd); cudaFree(dVd);
 }
 
 // Device-resident, CUDA-event-timed benchmark. Returns avg ms/iter.
@@ -505,14 +609,14 @@ extern "C" double gonn_bench_flash_attn_f64(int BH, int S, int d, int iters, int
     double scale = 1.0 / sqrt((double)d);
 
     for (int i = 0; i < 5; i++)
-        launch_flash_f64(dQ, dK, dV, dO, BH, S, d, scale, causal);
+        launch_flash_f64(dQ, dK, dV, dO, nullptr, BH, S, d, scale, causal);
     cudaDeviceSynchronize();
 
     cudaEvent_t s, e;
     cudaEventCreate(&s); cudaEventCreate(&e);
     cudaEventRecord(s);
     for (int i = 0; i < iters; i++)
-        launch_flash_f64(dQ, dK, dV, dO, BH, S, d, scale, causal);
+        launch_flash_f64(dQ, dK, dV, dO, nullptr, BH, S, d, scale, causal);
     cudaEventRecord(e);
     cudaEventSynchronize(e);
     float ms = 0.0f;

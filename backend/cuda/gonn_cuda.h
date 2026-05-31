@@ -64,6 +64,17 @@ void gonn_flash_attn_f64(const double* Q, const double* K, const double* V,
 // Device-resident, CUDA-event-timed benchmark; returns average ms per iter.
 double gonn_bench_flash_attn_f64(int BH, int S, int d, int iters, int causal);
 
+// Training forward: also returns L (logsumexp per query row, length BH*S),
+// needed by the backward pass.
+void gonn_flash_attn_f64_fwd(const double* Q, const double* K, const double* V,
+                             double* O, double* L, int BH, int S, int d,
+                             double scale, int causal);
+// Backward: from Q,K,V,O,L,dO compute dQ,dK,dV (each (BH,S,d)).
+void gonn_flash_attn_f64_bwd(const double* Q, const double* K, const double* V,
+                             const double* O, const double* L, const double* dO,
+                             double* dQ, double* dK, double* dV,
+                             int BH, int S, int d, double scale, int causal);
+
 #ifdef __cplusplus
 }
 #endif

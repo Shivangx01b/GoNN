@@ -51,9 +51,19 @@ func (m *MultiHeadAttention) Forward(q, k, v *tensor.Tensor, causal bool) *tenso
 	kp = kp.Reshape(B, Tk, H, D).Permute(0, 2, 1, 3)
 	vp = vp.Reshape(B, Tk, H, D).Permute(0, 2, 1, 3)
 
+	scale := 1.0 / math.Sqrt(float64(D))
+
+	// Fully-differentiable fused GPU path: when the CUDA flash-attention kernel
+	// is available and applicable, run the whole scaled-dot-product core (incl.
+	// its backward) through it. This is what makes training use the kernel.
+	if fusedAttnAvailable() && D == 64 && Tq == Tk {
+		ctx := fusedAttnDiff(qp, kp, vp, B*H, Tq, D, scale, causal).
+			Permute(0, 2, 1, 3).Reshape(B, Tq, m.EmbedDim)
+		return m.OutProj.Forward(ctx)
+	}
+
 	// scores = qp @ kp^T -> (B, H, Tq, Tk)
 	scores := batchedMatMul(qp, transposeLastTwo(kp))
-	scale := 1.0 / math.Sqrt(float64(D))
 	scores = scores.MulScalar(scale)
 
 	if causal {

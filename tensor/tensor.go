@@ -236,6 +236,33 @@ func (t *Tensor) Backward() {
 	}
 }
 
+// MakeNode attaches a custom autograd node to out: it records inputs and a
+// backward closure that, given out's gradient, returns the gradient for each
+// input (same order as inputs; a nil entry skips that input). This is the
+// escape hatch for custom ops (e.g. a fused CUDA kernel) that compute their
+// own forward/backward outside the built-in op set. If no input requires grad,
+// out is left as a plain leaf.
+func MakeNode(out *Tensor, name string, inputs []*Tensor, backward func(grad *Tensor) []*Tensor) {
+	needsGrad := false
+	for _, in := range inputs {
+		if in != nil && (in.RequiresGrad || in.creator != nil) {
+			needsGrad = true
+			break
+		}
+	}
+	if !needsGrad {
+		return
+	}
+	out.RequiresGrad = true
+	out.creator = &Function{
+		Name:   name,
+		Inputs: inputs,
+		Backward: func(grad *Tensor, _ []interface{}, _ []*Tensor) []*Tensor {
+			return backward(grad)
+		},
+	}
+}
+
 // numel returns the product of dims.
 func numel(shape []int) int {
 	if len(shape) == 0 {
