@@ -7,8 +7,9 @@ package backend
 type Device string
 
 const (
-	CPU  Device = "cpu"
-	CUDA Device = "cuda"
+	CPU    Device = "cpu"
+	CUDA   Device = "cuda"
+	OpenCL Device = "opencl"
 )
 
 // Backend is the minimal contract a compute target must implement. For v1

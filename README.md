@@ -38,7 +38,7 @@ GoNN is a single-binary, dependency-light alternative to PyTorch / tinygrad / Te
   - **Preprocessing:** StandardScaler, MinMaxScaler, OneHotEncoder, LabelEncoder, PolynomialFeatures.
   - **Metrics + model selection:** Accuracy, Precision/Recall/F1, ConfusionMatrix, MSE/MAE/R²/SilhouetteScore/ROCAUC, TrainTestSplit, KFold, CrossValScore.
 - **`data` package** — `Dataset`, `DataLoader`, transforms, MNIST/CSV loaders, synthetic dataset generators (`MakeRegression`, `MakeClassification`, `MakeBlobs`, `MakeMoons`).
-- **`backend` package** — pluggable compute backend. The CPU backend uses gonum's BLAS for matmul; the CUDA backend (`-tags cuda`, CGO + cuBLAS) is wired into `tensor.MatMul`, so real models run their GEMMs on the GPU. Verified on an RTX 3060 and benchmarked against PyTorch / TensorFlow / tinygrad (see [Benchmarks](#benchmarks)).
+- **`backend` package** — pluggable compute backend with three implementations: **CPU** (gonum BLAS), **CUDA** (`-tags cuda`, CGO + cuBLAS, wired into `tensor.MatMul` so real models run GEMMs on the GPU; verified on an RTX 3060 and benchmarked vs PyTorch/TensorFlow/tinygrad — see [Benchmarks](#benchmarks)), and **OpenCL** (`-tags opencl`, CGO + fp64 kernels; numerically verified against the CPU backend). One `backend.Backend` interface; callers don't change.
 - **Fused CUDA flash-attention (forward + backward)** — a custom fp64 flash-attention kernel (online softmax, no S×S materialization) wired into `nn.MultiHeadAttention`. On **causal** fp64 attention it is **~1.4–1.5× faster than PyTorch's SDPA**, and its fused backward (gradcheck ≈ 5e-8) lets the differentiable `Forward` **train** on the kernel — not just run inference.
 
 Everything compiles to a single static Go binary (no Python runtime).
@@ -193,6 +193,21 @@ docker run --rm --gpus all -v "$PWD":/work -w /work gonn-cuda \
 This compiles `gonn_cuda.cu` with `nvcc`, builds GoNN `-tags cuda`, verifies
 correctness on the GPU, then runs the matmul, elementwise, flash-attention, and
 `MultiHeadAttention.ForwardFused` benchmarks.
+
+### OpenCL backend (`-tags opencl`)
+
+The OpenCL backend (`backend/opencl`, fp64 kernels mirroring the CUDA ones) is
+numerically verified against the CPU backend:
+
+```bash
+docker run --rm --gpus all -v "$PWD":/work -w /work gonn-cuda \
+    bash benchmark/docker/opencl_run.sh
+```
+
+It runs on **any** OpenCL device. The verification uses the portable `oclgrind`
+fp64 runtime because this machine's Docker/WSL2 GPU passthrough does not inject
+NVIDIA's OpenCL driver; the same binary runs on the GPU wherever a real GPU
+OpenCL ICD is present (native Linux + NVIDIA driver, or a Windows host).
 
 ## Benchmarks
 
