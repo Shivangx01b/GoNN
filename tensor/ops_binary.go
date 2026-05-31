@@ -53,6 +53,8 @@ func binOp(a, b *Tensor, op string) *Tensor {
 			out.Data[i] = ax.Data[i] / bx.Data[i]
 		}
 	}
+	out.Dtype = promote(a.Dtype, b.Dtype)
+	castInPlace(out)
 	if a.RequiresGrad || b.RequiresGrad || a.creator != nil || b.creator != nil {
 		out.RequiresGrad = true
 		out.creator = &Function{
@@ -106,6 +108,8 @@ func (t *Tensor) MatMul(o *Tensor) *Tensor {
 	// Dispatch the heavy GEMM through the active compute backend (CPU by
 	// default; cuBLAS when built with -tags cuda and a CUDA backend is set).
 	out := New(matmul2D(t.Data, o.Data, m, k, n), m, n)
+	out.Dtype = promote(t.Dtype, o.Dtype)
+	castInPlace(out)
 	if t.RequiresGrad || o.RequiresGrad || t.creator != nil || o.creator != nil {
 		out.RequiresGrad = true
 		out.creator = &Function{

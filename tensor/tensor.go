@@ -18,6 +18,7 @@ type Tensor struct {
 	Data         []float64
 	Shape        []int
 	Strides      []int
+	Dtype        DType // logical element precision; zero value = Float64
 	RequiresGrad bool
 	Grad         *Tensor
 	creator      *Function
@@ -125,6 +126,7 @@ func (t *Tensor) Copy() *Tensor {
 		Data:         d,
 		Shape:        append([]int(nil), t.Shape...),
 		Strides:      append([]int(nil), t.Strides...),
+		Dtype:        t.Dtype,
 		RequiresGrad: t.RequiresGrad,
 	}
 }
@@ -158,6 +160,9 @@ func (t *Tensor) String() string {
 		sb.WriteString(fmt.Sprintf("%v", t.Data))
 	} else {
 		sb.WriteString(fmt.Sprintf("[%v ... %v]", t.Data[:8], t.Data[len(t.Data)-8:]))
+	}
+	if t.Dtype != Float64 {
+		sb.WriteString(", dtype=" + t.Dtype.String())
 	}
 	if t.RequiresGrad {
 		sb.WriteString(", requires_grad=true")
