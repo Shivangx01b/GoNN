@@ -1,10 +1,29 @@
 package nn
 
 import (
+	"math"
 	"testing"
 
 	"gonn/tensor"
 )
+
+// TestBCELossNumericalStability checks that predictions at the {0,1} boundary
+// (which would make log(0) = -Inf) yield finite loss and gradients.
+func TestBCELossNumericalStability(t *testing.T) {
+	pred := tensor.New([]float64{0, 1, 0, 1}, 4).SetRequiresGrad(true)
+	tgt := tensor.New([]float64{0, 1, 1, 0}, 4)
+	loss := BCELoss(pred, tgt)
+	v := assertScalar(t, loss)
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		t.Fatalf("BCELoss produced non-finite loss: %v", v)
+	}
+	loss.Backward()
+	for i, g := range pred.Grad.Data {
+		if math.IsNaN(g) || math.IsInf(g, 0) {
+			t.Fatalf("BCELoss grad[%d] non-finite: %v", i, g)
+		}
+	}
+}
 
 // assertScalar checks that t is a scalar tensor and returns its value.
 func assertScalar(t *testing.T, x *tensor.Tensor) float64 {

@@ -307,3 +307,249 @@ GONN_UNARY(gonn_gelu,    gelu_kernel)
 GONN_UNARY(gonn_silu,    silu_kernel)
 
 extern "C" void gonn_sync() { cudaDeviceSynchronize(); }
+
+// ---------------------------------------------------------------------------
+// Device-resident benchmarks: allocate once, loop the kernel, time with events.
+// This is the apples-to-apples comparison vs PyTorch/tinygrad (data already on
+// device; only the kernel is timed; no H2D/D2H per call).
+// ---------------------------------------------------------------------------
+
+__global__ void addf_kernel(const float* A, const float* B, float* C, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) C[i] = A[i] + B[i];
+}
+
+extern "C" double gonn_bench_matmul_dev(int m, int k, int n, int iters, int f32) {
+    ensure_handle();
+    size_t esz = f32 ? sizeof(float) : sizeof(double);
+    void *dA, *dB, *dC;
+    if (cudaMalloc(&dA, esz * (size_t)m * k) != cudaSuccess) return -1.0;
+    if (cudaMalloc(&dB, esz * (size_t)k * n) != cudaSuccess) { cudaFree(dA); return -1.0; }
+    if (cudaMalloc(&dC, esz * (size_t)m * n) != cudaSuccess) { cudaFree(dA); cudaFree(dB); return -1.0; }
+    cudaMemset(dA, 1, esz * (size_t)m * k);
+    cudaMemset(dB, 1, esz * (size_t)k * n);
+
+    const float  a32 = 1.0f, b32 = 0.0f;
+    const double a64 = 1.0,  b64 = 0.0;
+    // cuBLAS is column-major: compute C^T = B^T * A^T so the row-major result
+    // lands in dC (same trick as gonn_matmul).
+    #define GEMM_ONCE()                                                              \
+        do {                                                                         \
+            if (f32) cublasSgemm(g_handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,        \
+                                 &a32, (const float*)dB, n, (const float*)dA, k,     \
+                                 &b32, (float*)dC, n);                               \
+            else     cublasDgemm(g_handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,        \
+                                 &a64, (const double*)dB, n, (const double*)dA, k,   \
+                                 &b64, (double*)dC, n);                              \
+        } while (0)
+
+    for (int i = 0; i < 5; i++) GEMM_ONCE();   // warmup
+    cudaDeviceSynchronize();
+
+    cudaEvent_t s, e;
+    cudaEventCreate(&s); cudaEventCreate(&e);
+    cudaEventRecord(s);
+    for (int i = 0; i < iters; i++) GEMM_ONCE();
+    cudaEventRecord(e);
+    cudaEventSynchronize(e);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, s, e);
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    #undef GEMM_ONCE
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    return (double)ms / iters;
+}
+
+// ---------------------------------------------------------------------------
+// Fused flash-attention-style forward, float64 (one launch, online softmax,
+// NO S*S score matrix materialized). One thread per query row; keys streamed.
+// Q,K,V,O are (BH, S, d) row-major. d <= 128. scale typically 1/sqrt(d).
+// ---------------------------------------------------------------------------
+// Generic fallback (one thread per query row) for d != 64.
+__global__ void flash_attn_f64_kernel(const double* Q, const double* K, const double* V,
+                                      double* O, int BH, int S, int d, double scale, int causal) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= BH * S) return;
+    int bh = row / S, i = row % S;
+    const double* q  = Q + (size_t)row * d;
+    const double* Kb = K + (size_t)(bh * S) * d;
+    const double* Vb = V + (size_t)(bh * S) * d;
+    double* o = O + (size_t)row * d;
+    double ql[128], acc[128];
+    for (int t = 0; t < d; t++) { ql[t] = q[t]; acc[t] = 0.0; }
+    double m = -CUDART_INF, l = 0.0;
+    int jmax = causal ? (i + 1) : S;
+    for (int j = 0; j < jmax; j++) {
+        const double* k = Kb + (size_t)j * d;
+        double s = 0.0;
+        for (int t = 0; t < d; t++) s += ql[t] * k[t];
+        s *= scale;
+        double m_new = fmax(m, s);
+        double corr = exp(m - m_new);
+        double p = exp(s - m_new);
+        const double* v = Vb + (size_t)j * d;
+        for (int t = 0; t < d; t++) acc[t] = acc[t] * corr + p * v[t];
+        l = l * corr + p;
+        m = m_new;
+    }
+    double inv = 1.0 / l;
+    for (int t = 0; t < d; t++) o[t] = acc[t] * inv;
+}
+
+// Tiled flash attention (d == 64): a block of TILE_Q queries from the same
+// (bh) cooperatively streams K/V in tiles through shared memory, so each K[j]
+// and V[j] is read from global once per block instead of once per query. Each
+// thread owns one query row and keeps its d=64 accumulator in registers.
+#define TILE_Q 64
+#define TILE_K 16
+__global__ void flash_attn_f64_tiled(const double* Q, const double* K, const double* V,
+                                     double* O, int BH, int S, double scale, int causal) {
+    const int d = 64;
+    int bh = blockIdx.y;
+    int q0 = blockIdx.x * TILE_Q;
+    int tid = threadIdx.x;            // 0..TILE_Q-1, one query per thread
+    int i = q0 + tid;
+    bool active = i < S;
+
+    const double* Kb = K + (size_t)(bh * S) * d;
+    const double* Vb = V + (size_t)(bh * S) * d;
+
+    __shared__ double sK[TILE_K][64];
+    __shared__ double sV[TILE_K][64];
+
+    double q[64];
+    double acc[64];
+    if (active) {
+        const double* qp = Q + (size_t)(bh * S + i) * d;
+        for (int t = 0; t < d; t++) { q[t] = qp[t]; acc[t] = 0.0; }
+    }
+    double m = -CUDART_INF, l = 0.0;
+    int jmax = causal ? (q0 + TILE_Q) : S;   // upper bound any thread in block needs
+    if (jmax > S) jmax = S;
+
+    for (int j0 = 0; j0 < jmax; j0 += TILE_K) {
+        int tk = TILE_K;
+        if (j0 + tk > S) tk = S - j0;
+        // cooperative load of K/V tile into shared (TILE_Q threads, TILE_K*64 doubles)
+        for (int idx = tid; idx < tk * d; idx += TILE_Q) {
+            sK[idx / d][idx % d] = Kb[(size_t)(j0) * d + idx];
+            sV[idx / d][idx % d] = Vb[(size_t)(j0) * d + idx];
+        }
+        __syncthreads();
+        if (active) {
+            for (int jj = 0; jj < tk; jj++) {
+                int j = j0 + jj;
+                if (causal && j > i) break;
+                double s = 0.0;
+                #pragma unroll
+                for (int t = 0; t < 64; t++) s += q[t] * sK[jj][t];
+                s *= scale;
+                double m_new = fmax(m, s);
+                double corr = exp(m - m_new);
+                double p = exp(s - m_new);
+                #pragma unroll
+                for (int t = 0; t < 64; t++) acc[t] = acc[t] * corr + p * sV[jj][t];
+                l = l * corr + p;
+                m = m_new;
+            }
+        }
+        __syncthreads();
+    }
+    if (active) {
+        double inv = 1.0 / l;
+        double* o = O + (size_t)(bh * S + i) * d;
+        for (int t = 0; t < d; t++) o[t] = acc[t] * inv;
+    }
+}
+
+// Launch helper: pick the tiled kernel for d == 64, else the generic fallback.
+static void launch_flash_f64(const double* Q, const double* K, const double* V, double* O,
+                             int BH, int S, int d, double scale, int causal) {
+    if (d == 64) {
+        dim3 grid((S + TILE_Q - 1) / TILE_Q, BH);
+        flash_attn_f64_tiled<<<grid, TILE_Q>>>(Q, K, V, O, BH, S, scale, causal);
+    } else {
+        int threads = 128, blocks = (BH * S + threads - 1) / threads;
+        flash_attn_f64_kernel<<<blocks, threads>>>(Q, K, V, O, BH, S, d, scale, causal);
+    }
+}
+
+// Run once on host pointers (H2D, launch, D2H) — for correctness checks.
+extern "C" void gonn_flash_attn_f64(const double* Q, const double* K, const double* V,
+                                    double* O, int BH, int S, int d, double scale, int causal) {
+    size_t qn = (size_t)BH * S * d;
+    double *dQ, *dK, *dV, *dO;
+    cudaMalloc(&dQ, sizeof(double) * qn);
+    cudaMalloc(&dK, sizeof(double) * qn);
+    cudaMalloc(&dV, sizeof(double) * qn);
+    cudaMalloc(&dO, sizeof(double) * qn);
+    cudaMemcpy(dQ, Q, sizeof(double) * qn, cudaMemcpyHostToDevice);
+    cudaMemcpy(dK, K, sizeof(double) * qn, cudaMemcpyHostToDevice);
+    cudaMemcpy(dV, V, sizeof(double) * qn, cudaMemcpyHostToDevice);
+    launch_flash_f64(dQ, dK, dV, dO, BH, S, d, scale, causal);
+    cudaMemcpy(O, dO, sizeof(double) * qn, cudaMemcpyDeviceToHost);
+    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+}
+
+// Device-resident, CUDA-event-timed benchmark. Returns avg ms/iter.
+extern "C" double gonn_bench_flash_attn_f64(int BH, int S, int d, int iters, int causal) {
+    size_t qn = (size_t)BH * S * d;
+    double *dQ, *dK, *dV, *dO;
+    if (cudaMalloc(&dQ, sizeof(double) * qn) != cudaSuccess) return -1.0;
+    if (cudaMalloc(&dK, sizeof(double) * qn) != cudaSuccess) { cudaFree(dQ); return -1.0; }
+    if (cudaMalloc(&dV, sizeof(double) * qn) != cudaSuccess) { cudaFree(dQ); cudaFree(dK); return -1.0; }
+    if (cudaMalloc(&dO, sizeof(double) * qn) != cudaSuccess) { cudaFree(dQ); cudaFree(dK); cudaFree(dV); return -1.0; }
+    cudaMemset(dQ, 0, sizeof(double) * qn);
+    cudaMemset(dK, 0, sizeof(double) * qn);
+    cudaMemset(dV, 0, sizeof(double) * qn);
+    double scale = 1.0 / sqrt((double)d);
+
+    for (int i = 0; i < 5; i++)
+        launch_flash_f64(dQ, dK, dV, dO, BH, S, d, scale, causal);
+    cudaDeviceSynchronize();
+
+    cudaEvent_t s, e;
+    cudaEventCreate(&s); cudaEventCreate(&e);
+    cudaEventRecord(s);
+    for (int i = 0; i < iters; i++)
+        launch_flash_f64(dQ, dK, dV, dO, BH, S, d, scale, causal);
+    cudaEventRecord(e);
+    cudaEventSynchronize(e);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, s, e);
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+    return (double)ms / iters;
+}
+
+extern "C" double gonn_bench_add_dev(int n, int iters, int f32) {
+    size_t esz = f32 ? sizeof(float) : sizeof(double);
+    void *dA, *dB, *dC;
+    if (cudaMalloc(&dA, esz * (size_t)n) != cudaSuccess) return -1.0;
+    if (cudaMalloc(&dB, esz * (size_t)n) != cudaSuccess) { cudaFree(dA); return -1.0; }
+    if (cudaMalloc(&dC, esz * (size_t)n) != cudaSuccess) { cudaFree(dA); cudaFree(dB); return -1.0; }
+    cudaMemset(dA, 1, esz * (size_t)n);
+    cudaMemset(dB, 1, esz * (size_t)n);
+    int threads = 256, blocks = (n + threads - 1) / threads;
+
+    for (int i = 0; i < 5; i++) {
+        if (f32) addf_kernel<<<blocks, threads>>>((float*)dA, (float*)dB, (float*)dC, n);
+        else     add_kernel<<<blocks, threads>>>((double*)dA, (double*)dB, (double*)dC, n);
+    }
+    cudaDeviceSynchronize();
+
+    cudaEvent_t s, e;
+    cudaEventCreate(&s); cudaEventCreate(&e);
+    cudaEventRecord(s);
+    for (int i = 0; i < iters; i++) {
+        if (f32) addf_kernel<<<blocks, threads>>>((float*)dA, (float*)dB, (float*)dC, n);
+        else     add_kernel<<<blocks, threads>>>((double*)dA, (double*)dB, (double*)dC, n);
+    }
+    cudaEventRecord(e);
+    cudaEventSynchronize(e);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, s, e);
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    return (double)ms / iters;
+}

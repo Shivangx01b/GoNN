@@ -1,0 +1,178 @@
+[
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 256,
+    "ms_per_iter": 0.11350000022503082,
+    "gflops": 295.6337615283991,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 512,
+    "ms_per_iter": 0.7979000001796521,
+    "gflops": 336.4274419595941,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 1024,
+    "ms_per_iter": 5.576299999120238,
+    "gflops": 385.109059472913,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 2048,
+    "ms_per_iter": 43.10385000007955,
+    "gflops": 398.5692504026507,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "elementwise_add",
+    "size": 1000000,
+    "ms_per_iter": 0.05624999903375283,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "relu",
+    "size": 1000000,
+    "ms_per_iter": 0.05889999920327682,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "elementwise_add",
+    "size": 10000000,
+    "ms_per_iter": 4.366899999695306,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "relu",
+    "size": 10000000,
+    "ms_per_iter": 2.906349999648228,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 256,
+    "ms_per_iter": 0.29224999980215216,
+    "gflops": 114.81413865770995,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 512,
+    "ms_per_iter": 2.1771999990960467,
+    "gflops": 123.29388945041886,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 1024,
+    "ms_per_iter": 14.525049999974726,
+    "gflops": 147.84690228286559,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 2048,
+    "ms_per_iter": 103.5750499995629,
+    "gflops": 165.86879933026825,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "elementwise_add",
+    "size": 1000000,
+    "ms_per_iter": 0.10634999944159063,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "relu",
+    "size": 1000000,
+    "ms_per_iter": 0.06769999981770525,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "elementwise_add",
+    "size": 10000000,
+    "ms_per_iter": 10.128250000889238,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "pytorch",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "relu",
+    "size": 10000000,
+    "ms_per_iter": 7.020749999355758,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  }
+]

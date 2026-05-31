@@ -1,0 +1,90 @@
+[
+  {
+    "framework": "gonn",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 256,
+    "ms_per_iter": 0.8975,
+    "gflops": 37.386553760445686,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "gonn",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 512,
+    "ms_per_iter": 6.3202,
+    "gflops": 42.472620486693465,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "gonn",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 1024,
+    "ms_per_iter": 52.7997,
+    "gflops": 40.672269880321295,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "gonn",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 2048,
+    "ms_per_iter": 425.6672,
+    "gflops": 40.35986137527158,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "gonn",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "elementwise_add",
+    "size": 1000000,
+    "ms_per_iter": 1.5152,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "gonn",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "relu",
+    "size": 1000000,
+    "ms_per_iter": 4.8158,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "gonn",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "elementwise_add",
+    "size": 10000000,
+    "ms_per_iter": 15.5505,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "gonn",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "relu",
+    "size": 10000000,
+    "ms_per_iter": 47.2554,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  }
+]

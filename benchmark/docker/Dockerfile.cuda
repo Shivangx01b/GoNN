@@ -1,0 +1,20 @@
+# CUDA build/runtime image for GoNN: nvcc + gcc (from CUDA devel) + Go.
+# Build once:
+#   docker build -f benchmark/docker/Dockerfile.cuda -t gonn-cuda .
+# Run (repo mounted, GPU attached):
+#   docker run --rm --gpus all -v "E:\lu\GoNN":/work -w /work gonn-cuda bash benchmark/docker/build_and_run.sh
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+ARG GO_VERSION=1.23.1
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget ca-certificates git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN wget -q https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -O /tmp/go.tgz && \
+    tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
+ENV PATH=/usr/local/go/bin:/usr/local/cuda/bin:$PATH
+ENV CGO_ENABLED=1
+ENV GOFLAGS=-buildvcs=false
+
+WORKDIR /work

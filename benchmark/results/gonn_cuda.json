@@ -1,0 +1,90 @@
+[
+  {
+    "framework": "gonn",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 256,
+    "ms_per_iter": 0.60595,
+    "gflops": 55.37491872266689,
+    "iters": 20,
+    "transfer": "per-call-h2d-d2h"
+  },
+  {
+    "framework": "gonn",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 512,
+    "ms_per_iter": 4.679559,
+    "gflops": 57.363408816941934,
+    "iters": 20,
+    "transfer": "per-call-h2d-d2h"
+  },
+  {
+    "framework": "gonn",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 1024,
+    "ms_per_iter": 19.372921,
+    "gflops": 110.84976024007943,
+    "iters": 20,
+    "transfer": "per-call-h2d-d2h"
+  },
+  {
+    "framework": "gonn",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 2048,
+    "ms_per_iter": 119.047197,
+    "gflops": 144.31141275842052,
+    "iters": 20,
+    "transfer": "per-call-h2d-d2h"
+  },
+  {
+    "framework": "gonn",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "elementwise_add",
+    "size": 1000000,
+    "ms_per_iter": 4.678436,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "per-call-h2d-d2h"
+  },
+  {
+    "framework": "gonn",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "relu",
+    "size": 1000000,
+    "ms_per_iter": 3.768704,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "per-call-h2d-d2h"
+  },
+  {
+    "framework": "gonn",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "elementwise_add",
+    "size": 10000000,
+    "ms_per_iter": 38.564297,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "per-call-h2d-d2h"
+  },
+  {
+    "framework": "gonn",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "relu",
+    "size": 10000000,
+    "ms_per_iter": 28.788034,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "per-call-h2d-d2h"
+  }
+]

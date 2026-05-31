@@ -38,7 +38,8 @@ GoNN is a single-binary, dependency-light alternative to PyTorch / tinygrad / Te
   - **Preprocessing:** StandardScaler, MinMaxScaler, OneHotEncoder, LabelEncoder, PolynomialFeatures.
   - **Metrics + model selection:** Accuracy, Precision/Recall/F1, ConfusionMatrix, MSE/MAE/R²/SilhouetteScore/ROCAUC, TrainTestSplit, KFold, CrossValScore.
 - **`data` package** — `Dataset`, `DataLoader`, transforms, MNIST/CSV loaders, synthetic dataset generators (`MakeRegression`, `MakeClassification`, `MakeBlobs`, `MakeMoons`).
-- **`backend` package** — CPU by default. CUDA via `-tags cuda` (CGO bindings to `backend/cuda/gonn_cuda.cu`, cuBLAS-backed matmul).
+- **`backend` package** — pluggable compute backend. The CPU backend uses gonum's BLAS for matmul; the CUDA backend (`-tags cuda`, CGO + cuBLAS) is wired into `tensor.MatMul`, so real models run their GEMMs on the GPU. Verified on an RTX 3060 and benchmarked against PyTorch / TensorFlow / tinygrad (see [Benchmarks](#benchmarks)).
+- **Fused CUDA flash-attention** — a custom fp64 flash-attention kernel (online softmax, no S×S materialization) wired into `nn.MultiHeadAttention.ForwardFused`. On **causal** fp64 attention it is **~1.4–1.5× faster than PyTorch's SDPA**.
 
 Everything compiles to a single static Go binary (no Python runtime).
 
@@ -170,12 +171,49 @@ The GPU backend currently accelerates:
 
 | Category    | Ops |
 |-------------|-----|
-| MatMul      | `MatMul` (cuBLAS `Dgemm`) |
+| MatMul      | `MatMul` (cuBLAS `Dgemm`/`Sgemm`) — dispatched from `tensor.MatMul` |
 | Elementwise | `AddElem`, `MulElem`, `Sub`, `Div`, `Scale`, `AxpyInto` (in-place `out += alpha*x`) |
 | Reductions  | `Sum`, `Max` (single-block tree reduce in shared memory) |
 | Activations | `ReLU`, `Sigmoid`, `Tanh`, `Exp`, `Log`, `GELU` (tanh approx.), `SiLU` (Swish) |
+| Attention   | Fused fp64 flash-attention forward (`flash_attn_f64_tiled`, online softmax) |
 
-Each op follows the same pattern as the original `gonn_add` / `gonn_mul` kernels: copy input slices to device memory, launch the kernel, copy the result back. There is no device-side buffer caching yet — correctness first, performance later.
+The CUDA backend is verified for correctness against the CPU backend on the GPU
+(matmul `maxAbsDiff ≈ 7e-16`). The tensor-op path copies host↔device per call
+(no device buffer caching yet); the device-resident benchmark path keeps inputs
+on the GPU and is the apples-to-apples comparison against other frameworks.
+
+### Reproducible GPU build (Docker, no local CUDA toolkit needed)
+
+```bash
+docker build -f benchmark/docker/Dockerfile.cuda -t gonn-cuda .
+docker run --rm --gpus all -v "$PWD":/work -w /work gonn-cuda \
+    bash benchmark/docker/build_and_run.sh
+```
+
+This compiles `gonn_cuda.cu` with `nvcc`, builds GoNN `-tags cuda`, verifies
+correctness on the GPU, then runs the matmul, elementwise, flash-attention, and
+`MultiHeadAttention.ForwardFused` benchmarks.
+
+## Benchmarks
+
+Run live on one machine (12-core CPU, RTX 3060) vs PyTorch 2.7.1+cu128,
+TensorFlow 2.20, tinygrad 0.13, with matched CUDA-event timing. Full methodology
+and tables: [`benchmark/REPORT.md`](benchmark/REPORT.md) and
+[`benchmark/RESULTS.md`](benchmark/RESULTS.md). Honest highlights:
+
+| op (N=2048 / shape) | GoNN | PyTorch | tinygrad | verdict |
+|---|---|---|---|---|
+| **causal attention f64** (GFLOP/s) | **~87–96** | 58–66 | — | **GoNN wins ~1.4–1.5×** (fused kernel) |
+| matmul f32 GPU (GFLOP/s) | **~7,700–8,150** | ~7,600 | 1,104 (OpenCL) | GoNN ≈ PyTorch; ~7× tinygrad |
+| matmul f64 GPU (GFLOP/s) | **~170–179** | ~174 | 176 | three-way tie (all cuBLAS) |
+| `MHA.ForwardFused` vs `Forward` | **5–6× faster**, maxAbsDiff ≈ 2e-16 | — | — | inference path |
+| matmul f64 CPU (GFLOP/s) | 40 (gonum) | **166** (MKL) | — | PyTorch (MKL) |
+
+**Honest summary:** GoNN's GPU matmul is on par with PyTorch (both lean on
+cuBLAS), it beats PyTorch ~1.5× on causal fp64 attention via a custom fused
+kernel, and its CPU matmul is 17× faster than the old naive loop but still behind
+MKL (pure Go has no SIMD intrinsics). GoNN is **not** "faster than PyTorch
+everywhere" — see the report for where it wins, ties, and loses.
 
 ## Project layout
 
@@ -186,8 +224,9 @@ GoNN/
 ├── optim/         # Optimizers + LR schedulers
 ├── ml/            # Classical ML algorithms
 ├── data/          # Datasets, DataLoader, transforms
-├── backend/       # CPU / CUDA backend contract
-│   └── cuda/      # CUDA kernels (build tag `cuda`)
+├── backend/       # CPU (gonum BLAS) / CUDA backend contract
+│   └── cuda/      # CUDA kernels + fused flash-attention (build tag `cuda`)
+├── benchmark/     # Cross-framework benchmarks + Docker GPU build + report
 ├── examples/      # Runnable demos
 └── main.go        # Top-level smoke test
 ```
@@ -208,4 +247,6 @@ Runnable demos under `examples/`:
 
 ## Status
 
-The tensor + autograd core, the full NN layer catalogue (linear, conv 1/2/3-d, conv-transpose, pooling/adaptive pooling, normalization, padding, upsample, RNN/LSTM/GRU with cells and bidirectional/multi-layer variants, Seq2Seq, attention, transformer encoder/decoder), all common optimizers and schedulers, and the classical ML catalogue (linear, discriminant, trees, ensembles, boosting, isolation forest, SVM, NB, KNN, clustering, dimensionality reduction, preprocessing, metrics) are implemented and tested. Coverage of more exotic corners (sparse ops, distributed training, JIT, CTC) is intentionally not pursued.
+The tensor + autograd core, the full NN layer catalogue (linear, conv 1/2/3-d, conv-transpose, pooling/adaptive pooling, normalization, padding, upsample, RNN/LSTM/GRU with cells and bidirectional/multi-layer variants, Seq2Seq, attention, transformer encoder/decoder), all common optimizers and schedulers, and the classical ML catalogue (linear, discriminant, trees, ensembles, boosting, isolation forest, SVM, NB, KNN, clustering, dimensionality reduction, preprocessing, metrics) are implemented and tested. The compute backend is pluggable: CPU (gonum BLAS) by default, CUDA (cuBLAS + custom kernels, incl. a fused fp64 flash-attention) via `-tags cuda`, verified on GPU and benchmarked against PyTorch/TensorFlow/tinygrad. Coverage of more exotic corners (sparse ops, distributed training, JIT, CTC) is intentionally not pursued.
+
+Recent correctness fixes: `Concat`/`Stack` are now autograd-aware (previously dropped gradients), `BCELoss` clamps to avoid `log(0)`, BatchNorm tracks the unbiased running variance (PyTorch parity), and the CUDA backend now compiles (a constant `-1.0/0.0` had blocked it).

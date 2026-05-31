@@ -33,7 +33,10 @@ func main() {
 	params = append(params, head.Parameters()...)
 	opt := optim.NewAdam(params, 5e-3)
 
-	for step := 0; step < 80; step++ {
+	// The post-norm encoder sits on a ~50% plateau for the first couple hundred
+	// steps on this parity task before it breaks through to 100%, so train long
+	// enough to escape it.
+	for step := 0; step < 400; step++ {
 		X, Y := makeBatch(32)
 		emb := embedding.Forward(X)        // (B, seq, embDim)
 		enc := encoder.Forward(emb)        // (B, seq, embDim)
@@ -44,7 +47,7 @@ func main() {
 		opt.ZeroGrad()
 		loss.Backward()
 		opt.Step()
-		if step%10 == 0 {
+		if step%40 == 0 {
 			acc := accuracy(logits, Y)
 			fmt.Printf("step %3d  loss=%.4f  acc=%.2f%%\n", step, loss.Data[0], acc*100)
 		}

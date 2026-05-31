@@ -1,5 +1,7 @@
 package tensor
 
+import "gonn/backend"
+
 // Binary elementwise ops with broadcasting + autograd.
 
 // Add returns t + o.
@@ -101,18 +103,9 @@ func (t *Tensor) MatMul(o *Tensor) *Tensor {
 	if k != k2 {
 		panic("MatMul: inner dims do not match")
 	}
-	out := Zeros(m, n)
-	for i := 0; i < m; i++ {
-		for kk := 0; kk < k; kk++ {
-			a := t.Data[i*k+kk]
-			if a == 0 {
-				continue
-			}
-			for j := 0; j < n; j++ {
-				out.Data[i*n+j] += a * o.Data[kk*n+j]
-			}
-		}
-	}
+	// Dispatch the heavy GEMM through the active compute backend (CPU by
+	// default; cuBLAS when built with -tags cuda and a CUDA backend is set).
+	out := New(matmul2D(t.Data, o.Data, m, k, n), m, n)
 	if t.RequiresGrad || o.RequiresGrad || t.creator != nil || o.creator != nil {
 		out.RequiresGrad = true
 		out.creator = &Function{
@@ -135,20 +128,9 @@ func (t *Tensor) MatMul(o *Tensor) *Tensor {
 	return out
 }
 
+// matmul2D multiplies row-major A (m×k) by B (k×n) via the active backend.
 func matmul2D(A, B []float64, m, k, n int) []float64 {
-	out := make([]float64, m*n)
-	for i := 0; i < m; i++ {
-		for kk := 0; kk < k; kk++ {
-			a := A[i*k+kk]
-			if a == 0 {
-				continue
-			}
-			for j := 0; j < n; j++ {
-				out[i*n+j] += a * B[kk*n+j]
-			}
-		}
-	}
-	return out
+	return backend.Current().MatMul(A, B, m, k, n)
 }
 
 func transpose2D(A []float64, m, n int) []float64 {

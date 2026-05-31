@@ -178,10 +178,17 @@ func bnForward2D(x, w, bb, runMean, runVar *tensor.Tensor, training bool, eps, m
 		std := v.AddScalar(eps).Sqrt()
 		norm := xc.Div(std)
 		out := norm.Mul(w).Add(bb)
-		// update running stats (no grad)
+		// update running stats (no grad). PyTorch normalizes with the biased
+		// variance but tracks the unbiased variance (Bessel's correction) in
+		// the running estimate used at eval time.
+		n := x.Shape[0]
+		unbiased := 1.0
+		if n > 1 {
+			unbiased = float64(n) / float64(n-1)
+		}
 		for c := 0; c < runMean.Shape[0]; c++ {
 			runMean.Data[c] = (1-momentum)*runMean.Data[c] + momentum*mean.Data[c]
-			runVar.Data[c] = (1-momentum)*runVar.Data[c] + momentum*v.Data[c]
+			runVar.Data[c] = (1-momentum)*runVar.Data[c] + momentum*v.Data[c]*unbiased
 		}
 		return out
 	}

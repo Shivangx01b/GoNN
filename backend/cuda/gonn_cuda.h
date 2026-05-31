@@ -47,6 +47,23 @@ void gonn_silu(const double* A, double* C, int n);
 // Block until queued GPU work completes.
 void gonn_sync();
 
+// --- Device-resident benchmarks (no per-call H2D/D2H) -----------------------
+// Allocate inputs once on the device, run `iters` GEMMs, and time them with
+// CUDA events. Returns average ms per iter. f32 != 0 selects cublasSgemm
+// (float), else cublasDgemm (double). Mirrors how PyTorch/tinygrad measure a
+// device-resident op.
+double gonn_bench_matmul_dev(int m, int k, int n, int iters, int f32);
+// Device-resident elementwise add benchmark; returns average ms per iter.
+double gonn_bench_add_dev(int n, int iters, int f32);
+
+// --- Fused flash-attention forward (float64) --------------------------------
+// Q,K,V,O are (BH, S, d) row-major; scale is usually 1/sqrt(d); causal!=0 masks
+// future keys. One fused kernel, online softmax, no S*S materialization.
+void gonn_flash_attn_f64(const double* Q, const double* K, const double* V,
+                         double* O, int BH, int S, int d, double scale, int causal);
+// Device-resident, CUDA-event-timed benchmark; returns average ms per iter.
+double gonn_bench_flash_attn_f64(int BH, int S, int d, int iters, int causal);
+
 #ifdef __cplusplus
 }
 #endif

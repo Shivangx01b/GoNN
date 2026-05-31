@@ -77,6 +77,37 @@ func (m *MultiHeadAttention) Forward(q, k, v *tensor.Tensor, causal bool) *tenso
 	return m.OutProj.Forward(ctx)
 }
 
+// ForwardFused is a forward-only (inference) attention path that runs the
+// scaled-dot-product core on the GPU via the fused flash-attention kernel,
+// replacing the projection -> batched-matmul -> softmax -> batched-matmul core
+// with a single kernel launch (online softmax, no S*S materialization).
+//
+// It is NOT autograd-differentiable through the attention core, so use it for
+// inference/generation only. It transparently falls back to the regular
+// (differentiable) Forward when the fused kernel is unavailable (non-cuda
+// build), when HeadDim != 64 (kernel specialization), or when Tq != Tk.
+func (m *MultiHeadAttention) ForwardFused(q, k, v *tensor.Tensor, causal bool) *tensor.Tensor {
+	B, Tq, _ := q.Shape[0], q.Shape[1], q.Shape[2]
+	Tk := k.Shape[1]
+	H, D := m.NumHeads, m.HeadDim
+
+	if !fusedAttnAvailable() || D != 64 || Tq != Tk {
+		return m.Forward(q, k, v, causal)
+	}
+
+	// Project and split heads -> (B, H, T, D), contiguous after Permute.
+	qp := m.QProj.Forward(q).Reshape(B, Tq, H, D).Permute(0, 2, 1, 3)
+	kp := m.KProj.Forward(k).Reshape(B, Tk, H, D).Permute(0, 2, 1, 3)
+	vp := m.VProj.Forward(v).Reshape(B, Tk, H, D).Permute(0, 2, 1, 3)
+
+	scale := 1.0 / math.Sqrt(float64(D))
+	// (B*H, T, D) row-major matches the kernel's (BH, S, d) layout exactly.
+	O := fusedAttnF64(qp.Data, kp.Data, vp.Data, B*H, Tq, D, scale, causal)
+
+	ctx := tensor.New(O, B, H, Tq, D).Permute(0, 2, 1, 3).Reshape(B, Tq, m.EmbedDim)
+	return m.OutProj.Forward(ctx)
+}
+
 // Parameters returns all linear projection parameters.
 func (m *MultiHeadAttention) Parameters() []*tensor.Tensor {
 	var ps []*tensor.Tensor

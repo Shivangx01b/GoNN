@@ -57,7 +57,10 @@ func NLLLoss(logProbs, targets *tensor.Tensor) *tensor.Tensor {
 }
 
 // BCELoss expects pred in [0,1]. Returns -mean(t*log(p) + (1-t)*log(1-p)).
+// pred is clamped to [eps, 1-eps] to avoid log(0) -> -Inf / NaN gradients.
 func BCELoss(pred, target *tensor.Tensor) *tensor.Tensor {
+	const eps = 1e-12
+	pred = pred.Clip(eps, 1-eps)
 	one := tensor.Scalar(1)
 	a := target.Mul(pred.Log())
 	b := one.Sub(target).Mul(one.Sub(pred).Log())

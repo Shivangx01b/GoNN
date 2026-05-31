@@ -24,6 +24,30 @@ func TestAdd(t *testing.T) {
 	approxEq(t, c.Data, []float64{5, 7, 9}, 1e-9)
 }
 
+func TestConcatBackward(t *testing.T) {
+	// sum(2x ++ 3x) => d/dx = 2 + 3 = 5 per element.
+	x := New([]float64{1, 2, 3}, 3).SetRequiresGrad(true)
+	Concat(0, x.MulScalar(2), x.MulScalar(3)).Sum().Backward()
+	approxEq(t, x.Grad.Data, []float64{5, 5, 5}, 1e-9)
+
+	// Independent inputs concatenated on axis 1, then squared.
+	a := New([]float64{1, 2}, 1, 2).SetRequiresGrad(true)
+	b := New([]float64{3, 4, 5}, 1, 3).SetRequiresGrad(true)
+	Concat(1, a, b).Square().Sum().Backward()
+	approxEq(t, a.Grad.Data, []float64{2, 4}, 1e-9)
+	approxEq(t, b.Grad.Data, []float64{6, 8, 10}, 1e-9)
+}
+
+func TestStackBackward(t *testing.T) {
+	x := New([]float64{1, 2, 3}, 3).SetRequiresGrad(true)
+	s := Stack(0, x.MulScalar(2), x.MulScalar(3))
+	if !shapesEqual(s.Shape, []int{2, 3}) {
+		t.Fatalf("Stack shape: got %v, want [2 3]", s.Shape)
+	}
+	s.Sum().Backward()
+	approxEq(t, x.Grad.Data, []float64{5, 5, 5}, 1e-9)
+}
+
 func TestMul(t *testing.T) {
 	a := New([]float64{1, 2, 3}, 3)
 	b := New([]float64{4, 5, 6}, 3)

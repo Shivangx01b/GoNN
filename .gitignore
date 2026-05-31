@@ -1,0 +1,4 @@
+# CUDA build artifacts
+backend/cuda/libgonn_cuda.so
+backend/cuda/*.dll
+backend/cuda/*.o

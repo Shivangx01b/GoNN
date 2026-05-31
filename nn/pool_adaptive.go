@@ -100,31 +100,10 @@ func adaptivePool1D(x *tensor.Tensor, N, C, L, outL int, isMax bool) *tensor.Ten
 		}
 		outs[i] = v
 	}
-	// Concatenate along axis 1 -> (N*C, outL).
+	// Concatenate the per-cell results (each (N*C, 1)) along axis 1 -> (N*C, outL).
+	// tensor.Concat is autograd-aware, so gradients flow back to each window.
 	cat := tensor.Concat(1, outs...)
-	// Note: Concat does not propagate autograd in tensor package, so build a
-	// gradient-aware version using stack via Reshape-friendly Add. Use a
-	// gather-based approach instead: place each into a zero canvas via
-	// broadcasted Mul + Add to keep autograd.
-	_ = cat // keep but rebuild differentiable version below.
-
-	// Differentiable assembly: each outs[i] has shape (N*C, 1). We create
-	// indicator vectors e_i (1, outL) with a 1 at position i, then
-	// outs[i] * e_i has shape (N*C, outL); summing all of them gives
-	// (N*C, outL) but with autograd preserved (Mul+Add).
-	var acc *tensor.Tensor
-	for i := 0; i < outL; i++ {
-		ind := make([]float64, outL)
-		ind[i] = 1
-		e := tensor.New(ind, 1, outL)
-		piece := outs[i].Mul(e) // (N*C, outL)
-		if acc == nil {
-			acc = piece
-		} else {
-			acc = acc.Add(piece)
-		}
-	}
-	return acc.Reshape(N, C, outL)
+	return cat.Reshape(N, C, outL)
 }
 
 // AdaptiveAvgPool2d applies adaptive average pooling on (N, C, H, W) -> (N, C, OutH, OutW).

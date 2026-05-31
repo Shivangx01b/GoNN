@@ -1,0 +1,178 @@
+[
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 256,
+    "ms_per_iter": 0.7013499989625416,
+    "gflops": 47.842634989142006,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 512,
+    "ms_per_iter": 1.6018999995139893,
+    "gflops": 167.5731669151897,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 1024,
+    "ms_per_iter": 5.399199999374105,
+    "gflops": 397.7410816878324,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 2048,
+    "ms_per_iter": 36.43800000008923,
+    "gflops": 471.48222141604725,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "elementwise_add",
+    "size": 1000000,
+    "ms_per_iter": 0.4686500005846028,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "relu",
+    "size": 1000000,
+    "ms_per_iter": 0.40315000023838365,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "elementwise_add",
+    "size": 10000000,
+    "ms_per_iter": 5.574099999648752,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float32",
+    "op": "relu",
+    "size": 10000000,
+    "ms_per_iter": 3.812850000031176,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 256,
+    "ms_per_iter": 0.9700999999040505,
+    "gflops": 34.58863210320458,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 512,
+    "ms_per_iter": 4.114899999876798,
+    "gflops": 65.23498894457633,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 1024,
+    "ms_per_iter": 22.963850000451203,
+    "gflops": 93.51583675898448,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 2048,
+    "ms_per_iter": 175.0924500001929,
+    "gflops": 98.11884626653561,
+    "iters": 20,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "elementwise_add",
+    "size": 1000000,
+    "ms_per_iter": 0.8913500005292008,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "relu",
+    "size": 1000000,
+    "ms_per_iter": 0.5188499999349006,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "elementwise_add",
+    "size": 10000000,
+    "ms_per_iter": 11.149149999255314,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  },
+  {
+    "framework": "tensorflow",
+    "device": "cpu",
+    "dtype": "float64",
+    "op": "relu",
+    "size": 10000000,
+    "ms_per_iter": 7.960750000165717,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "host"
+  }
+]

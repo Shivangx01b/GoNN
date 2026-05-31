@@ -288,26 +288,10 @@ func (g *MultiLayerGRU) Parameters() []*tensor.Tensor {
 
 // ----------------------------------------------------------------------------
 // concatFeature: concatenate two (B, T, H1) and (B, T, H2) tensors along the
-// feature axis, preserving autograd. We can't use tensor.Concat because it's
-// not autograd-aware, so we build a (H1+H2, H1+H2) selector pair the same
-// way sliceCol does, then add the two placed pieces.
+// feature axis, preserving autograd. tensor.Concat is autograd-aware, so the
+// forward/backward directions both receive gradients through the join.
 // ----------------------------------------------------------------------------
 
 func concatFeature(a, b *tensor.Tensor, B, T, H1, H2 int) *tensor.Tensor {
-	Hout := H1 + H2
-	// Pad a from H1 -> Hout by right-multiplying with a (H1, Hout) selector
-	// that copies columns into [0:H1]. Pad b into [H1:Hout]. Then add.
-	a2 := a.Reshape(B*T, H1)
-	b2 := b.Reshape(B*T, H2)
-	selA := tensor.Zeros(H1, Hout)
-	for i := 0; i < H1; i++ {
-		selA.Data[i*Hout+i] = 1
-	}
-	selB := tensor.Zeros(H2, Hout)
-	for i := 0; i < H2; i++ {
-		selB.Data[i*Hout+(H1+i)] = 1
-	}
-	aPlaced := a2.MatMul(selA) // (B*T, Hout)
-	bPlaced := b2.MatMul(selB)
-	return aPlaced.Add(bPlaced).Reshape(B, T, Hout)
+	return tensor.Concat(2, a, b)
 }

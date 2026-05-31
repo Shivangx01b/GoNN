@@ -1,0 +1,178 @@
+[
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 256,
+    "ms_per_iter": 1.6352499997083214,
+    "gflops": 20.519450852154158,
+    "iters": 20,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 512,
+    "ms_per_iter": 1.7875500006994116,
+    "gflops": 150.16948107463833,
+    "iters": 20,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 1024,
+    "ms_per_iter": 3.863400000227557,
+    "gflops": 555.8533022398695,
+    "iters": 20,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float32",
+    "op": "matmul",
+    "size": 2048,
+    "ms_per_iter": 15.567050000754534,
+    "gflops": 1103.6046767478292,
+    "iters": 20,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float32",
+    "op": "elementwise_add",
+    "size": 1000000,
+    "ms_per_iter": 0.7869499995649676,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float32",
+    "op": "relu",
+    "size": 1000000,
+    "ms_per_iter": 1.0225000005448237,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float32",
+    "op": "elementwise_add",
+    "size": 10000000,
+    "ms_per_iter": 1.346199999716191,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float32",
+    "op": "relu",
+    "size": 10000000,
+    "ms_per_iter": 1.2774000006174902,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 256,
+    "ms_per_iter": 2.5857500004349276,
+    "gflops": 12.976672916699638,
+    "iters": 20,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 512,
+    "ms_per_iter": 3.532400000949565,
+    "gflops": 75.99237230433708,
+    "iters": 20,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 1024,
+    "ms_per_iter": 14.959600000111095,
+    "gflops": 143.55221048584536,
+    "iters": 20,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "matmul",
+    "size": 2048,
+    "ms_per_iter": 97.46424999957526,
+    "gflops": 176.26841825669277,
+    "iters": 20,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "elementwise_add",
+    "size": 1000000,
+    "ms_per_iter": 0.8168000003934139,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "relu",
+    "size": 1000000,
+    "ms_per_iter": 1.1549000009836163,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "elementwise_add",
+    "size": 10000000,
+    "ms_per_iter": 1.570700000229408,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "device-resident"
+  },
+  {
+    "framework": "tinygrad",
+    "device": "cuda",
+    "dtype": "float64",
+    "op": "relu",
+    "size": 10000000,
+    "ms_per_iter": 1.5187000008154428,
+    "gflops": null,
+    "iters": 50,
+    "transfer": "device-resident"
+  }
+]

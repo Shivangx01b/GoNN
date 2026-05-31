@@ -163,7 +163,8 @@ func (t *Tensor) Expand(shape ...int) *Tensor {
 	return out
 }
 
-// Concat concatenates tensors along axis. No autograd for now.
+// Concat concatenates tensors along axis (autograd-aware: each input receives
+// the slice of the output gradient that it contributed).
 func Concat(axis int, tensors ...*Tensor) *Tensor {
 	if len(tensors) == 0 {
 		panic("Concat: empty input")
@@ -192,6 +193,38 @@ func Concat(axis int, tensors ...*Tensor) *Tensor {
 				out.Data[o*totalDim*stride+d*stride+k] = x.Data[o*xDim*stride+k]
 			}
 			d += xDim
+		}
+	}
+
+	needGrad := false
+	for _, x := range tensors {
+		if x.RequiresGrad || x.creator != nil {
+			needGrad = true
+			break
+		}
+	}
+	if needGrad {
+		out.RequiresGrad = true
+		inputs := append([]*Tensor(nil), tensors...)
+		out.creator = &Function{
+			Name:   "Concat",
+			Inputs: inputs,
+			Backward: func(grad *Tensor, _ []interface{}, ins []*Tensor) []*Tensor {
+				grads := make([]*Tensor, len(ins))
+				d := 0
+				for i, x := range ins {
+					xDim := x.Shape[axis]
+					gx := Zeros(x.Shape...)
+					for o := 0; o < outer; o++ {
+						for k := 0; k < xDim*stride; k++ {
+							gx.Data[o*xDim*stride+k] = grad.Data[o*totalDim*stride+d*stride+k]
+						}
+					}
+					grads[i] = gx
+					d += xDim
+				}
+				return grads
+			},
 		}
 	}
 	return out

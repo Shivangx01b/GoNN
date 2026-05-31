@@ -15,6 +15,7 @@ package cuda
 import "C"
 
 import (
+	"math"
 	"unsafe"
 
 	"gonn/backend"
@@ -133,7 +134,7 @@ func (cudaBackend) Sum(a []float64) float64 {
 func (cudaBackend) Max(a []float64) float64 {
 	if len(a) == 0 {
 		// Match cpuBackend semantics (-Inf for empty).
-		return -1.0 / 0.0
+		return math.Inf(-1)
 	}
 	var m C.double
 	C.gonn_max(
@@ -185,6 +186,54 @@ func (cudaBackend) GELU(a []float64) []float64 {
 
 func (cudaBackend) SiLU(a []float64) []float64 {
 	return unary(a, func(in, out *C.double, n C.int) { C.gonn_silu(in, out, n) })
+}
+
+// BenchMatMulDev runs a device-resident GEMM benchmark (inputs allocated once
+// on the GPU, iters GEMMs, CUDA-event timed). Returns avg ms/iter. f32 selects
+// cublasSgemm, else cublasDgemm. This is the apples-to-apples comparison vs
+// PyTorch/tinygrad device-resident timing.
+func BenchMatMulDev(m, k, n, iters int, f32 bool) float64 {
+	var f C.int
+	if f32 {
+		f = 1
+	}
+	return float64(C.gonn_bench_matmul_dev(C.int(m), C.int(k), C.int(n), C.int(iters), f))
+}
+
+// BenchAddDev runs a device-resident elementwise-add benchmark. Returns avg ms/iter.
+func BenchAddDev(n, iters int, f32 bool) float64 {
+	var f C.int
+	if f32 {
+		f = 1
+	}
+	return float64(C.gonn_bench_add_dev(C.int(n), C.int(iters), f))
+}
+
+// FlashAttnF64 runs the fused flash-attention forward on the GPU for inputs
+// Q,K,V of shape (BH, S, d) row-major, writing O. scale is usually 1/sqrt(d).
+// Used for correctness checks against a CPU reference.
+func FlashAttnF64(Q, K, V, O []float64, BH, S, d int, scale float64, causal bool) {
+	var c C.int
+	if causal {
+		c = 1
+	}
+	C.gonn_flash_attn_f64(
+		(*C.double)(unsafe.Pointer(&Q[0])),
+		(*C.double)(unsafe.Pointer(&K[0])),
+		(*C.double)(unsafe.Pointer(&V[0])),
+		(*C.double)(unsafe.Pointer(&O[0])),
+		C.int(BH), C.int(S), C.int(d), C.double(scale), c,
+	)
+}
+
+// BenchFlashAttnF64 runs the device-resident, CUDA-event-timed flash-attention
+// benchmark and returns average ms/iter.
+func BenchFlashAttnF64(BH, S, d, iters int, causal bool) float64 {
+	var c C.int
+	if causal {
+		c = 1
+	}
+	return float64(C.gonn_bench_flash_attn_f64(C.int(BH), C.int(S), C.int(d), C.int(iters), c))
 }
 
 // Backend returns the live CUDA backend.

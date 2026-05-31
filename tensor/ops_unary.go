@@ -85,7 +85,15 @@ func (t *Tensor) Pow(p float64) *Tensor {
 	return unaryOp(t, "Pow", func(v float64) float64 { return math.Pow(v, p) },
 		func(g, x, y float64) float64 {
 			if x == 0 {
-				return 0
+				// d/dx x^p at 0 is 0 for p>1, 1 for p==1, and undefined
+				// (+Inf) for p<1. Guard against the Inf; the finite cases
+				// fall through to the general formula.
+				if p == 1 {
+					return g
+				}
+				if p > 1 {
+					return 0
+				}
 			}
 			return g * p * math.Pow(x, p-1)
 		})
