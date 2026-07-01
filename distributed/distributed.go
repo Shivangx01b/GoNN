@@ -57,14 +57,28 @@
 //		}
 //	}
 //
+// # SyncBatchNorm
+//
+// Plain nn.BatchNorm* under DDP normalizes with shard-local statistics and
+// lets running stats drift apart across ranks. SyncBatchNorm{1,2,3}d (see
+// syncbn.go) fixes both, matching torch.nn.SyncBatchNorm: in training mode
+// the per-channel mean/variance are computed over the GLOBAL batch via
+// AllReduceSum, running statistics are updated from those global statistics
+// (so they stay bit-identical on every rank), and the backward pass
+// all-reduces the two per-channel gradient sums so dx matches a
+// single-process run on the concatenated batch. Convert a model by
+// constructing the norm layers with the group — same per-rank architecture,
+// exactly like torch.nn.SyncBatchNorm.convert_sync_batchnorm's result:
+//
+//	bn := distributed.NewSyncBatchNorm2d(group, 64) // instead of nn.NewBatchNorm2d(64)
+//
+// Because both the training-mode Forward and its Backward issue collectives,
+// every rank must run the same number of forward AND backward passes in the
+// same order (the usual SPMD rule; PyTorch DDP requires the same). Eval mode
+// uses running statistics only and performs no communication.
+//
 // # What is NOT implemented (explicitly)
 //
-//   - SyncBatchNorm: N/A. BatchNorm running statistics and batch statistics
-//     are purely rank-local — nothing synchronizes them, so BN layers WILL
-//     drift apart across ranks (breaking the bit-identical-parameters
-//     invariant for BN buffers) and normalize with shard, not global,
-//     statistics. Use GroupNorm/LayerNorm, or run BN in eval mode with
-//     pre-computed stats.
 //   - Fault tolerance / elasticity: a dropped connection fails the collective
 //     with an error; there is no rejoin.
 //   - Overlapped bucketed all-reduce (PyTorch's Reducer): gradients are
@@ -93,9 +107,10 @@ import (
 
 // Collective op codes (wire protocol).
 const (
-	opAllReduce byte = 1
-	opBroadcast byte = 2
-	opBarrier   byte = 3
+	opAllReduce    byte = 1
+	opBroadcast    byte = 2
+	opBarrier      byte = 3
+	opAllReduceSum byte = 4
 )
 
 // handshakeMagic guards against a stray client connecting to the coordinator.
@@ -274,6 +289,46 @@ func (g *Group) AllReduceMeanGrads(params []*tensor.Tensor) error {
 		return fmt.Errorf("distributed.AllReduceMeanGrads: recv: %w", err)
 	}
 	scatterGrads(params, avg)
+	return nil
+}
+
+// AllReduceSum replaces vals — in place, on every rank — with the
+// element-wise SUM of vals across all ranks (the collective behind
+// SyncBatchNorm's global statistics). It mirrors AllReduceMeanGrads'
+// structure: gather-to-root in rank order (deterministic reduction), sum at
+// rank 0, broadcast; every rank — including rank 0, which applies its own
+// summed buffer — ends up with bit-identical bytes. Element counts and op
+// codes are checked on every frame, so diverging call sequences or vector
+// lengths across ranks fail loudly instead of corrupting data.
+func (g *Group) AllReduceSum(vals []float64) error {
+	if g.world == 1 {
+		return nil // sum over one rank is the identity
+	}
+	if g.rank == 0 {
+		for r := 1; r < g.world; r++ { // rank order: deterministic reduction
+			v, err := readFrame(g.conns[r], opAllReduceSum, len(vals))
+			if err != nil {
+				return fmt.Errorf("distributed.AllReduceSum: recv from rank %d: %w", r, err)
+			}
+			for i := range vals {
+				vals[i] += v[i]
+			}
+		}
+		for r := 1; r < g.world; r++ {
+			if err := writeFrame(g.conns[r], opAllReduceSum, vals); err != nil {
+				return fmt.Errorf("distributed.AllReduceSum: send to rank %d: %w", r, err)
+			}
+		}
+		return nil
+	}
+	if err := writeFrame(g.conns[0], opAllReduceSum, vals); err != nil {
+		return fmt.Errorf("distributed.AllReduceSum: send: %w", err)
+	}
+	sum, err := readFrame(g.conns[0], opAllReduceSum, len(vals))
+	if err != nil {
+		return fmt.Errorf("distributed.AllReduceSum: recv: %w", err)
+	}
+	copy(vals, sum)
 	return nil
 }
 
