@@ -1,18 +1,22 @@
-// Package quant implements int8 per-tensor affine quantization in the style
-// of PyTorch eager-mode dynamic/static quantization.
+// Package quant implements int8 quantization in the style of PyTorch
+// eager-mode quantization: dynamic and static post-training quantization,
+// per-channel weight quantization, and quantization-aware training (QAT).
 //
 // Scope (documented, deliberate):
 //   - CPU-only pure-Go integer kernels. PyTorch's eager quantization is also
 //     CPU-only; GPU quantized kernels are out of scope.
-//   - Inference-only: quantized layers return plain tensors with no autograd
-//     graph. Quantization-aware training is out of scope.
-//   - Per-tensor quantization only (no per-channel).
+//   - Converted (Dynamic/Static) layers are inference-only: they return plain
+//     tensors with no autograd graph. QATLinear/FakeQuant are the trainable
+//     counterparts and carry full autograd via straight-through estimators.
 //
-// Semantics follow PyTorch's per-tensor affine scheme: for activations the
-// mapping is q = clamp(round(x/scale) + zero_point, -128, 127) with an
-// asymmetric (affine) scale/zero-point derived from the observed min/max
-// range nudged to include zero. Weights use symmetric quantization
-// (zero_point = 0, scale = max|w|/127, values clamped to [-127, 127]).
+// Semantics follow PyTorch's schemes: for activations the mapping is
+// q = clamp(round(x/scale) + zero_point, -128, 127) with an asymmetric
+// (affine) scale/zero-point derived from the observed min/max range nudged to
+// include zero. Weights use symmetric quantization (zero_point = 0,
+// scale = max|w|/127, values clamped to [-127, 127]), either per-tensor (the
+// default) or per output channel (QuantizePerChannel / the
+// WithPerChannelWeights option — PyTorch's per_channel_symmetric with
+// ch_axis=0).
 //
 // There is no module-tree rewriting helper (PyTorch's quantize_dynamic walks
 // the model via hooks/module replacement, which this framework does not
@@ -20,6 +24,25 @@
 //
 //	ql := quant.NewDynamicLinearFrom(model.FC1) // once, after training
 //	y := ql.Forward(x)                          // use in place of model.FC1
+//
+// # Quantization-aware training
+//
+// QAT simulates int8 quantization during training so the float weights learn
+// to compensate for quantization error. Wrap a Linear in a QATLinear, train
+// it as usual (FakeQuant modules fake-quantize the input and weight on every
+// forward, with clamped straight-through gradients into the real float
+// weight), then freeze it into a StaticLinear for integer inference:
+//
+//	l := nn.NewLinear(in, out, true)
+//	q := quant.NewQATLinearFrom(l)
+//	for _, batch := range batches {           // ordinary training loop
+//		loss := mse(q.Forward(batch.X), batch.Y)
+//		loss.Backward()
+//		opt.Step()                            // updates l.Weight / l.Bias
+//	}
+//	q.Eval()                                  // freeze observed qparams
+//	s := q.Convert()                          // -> *StaticLinear, int8 GEMM
+//	y := s.Forward(x)                         // matches q's eval-mode output
 package quant
 
 import (

@@ -8,47 +8,105 @@ import (
 	"gonn/tensor"
 )
 
+// LinearOption configures how a quantized Linear is built. Options are shared
+// by NewDynamicLinearFrom, NewStaticLinearFrom, and QATLinear.Convert.
+type LinearOption func(*linearOptions)
+
+type linearOptions struct {
+	perChannel bool
+}
+
+// WithPerChannelWeights quantizes the weight per output channel (axis 0, one
+// symmetric scale per output row — PyTorch's per_channel_symmetric weight
+// scheme) instead of the default per-tensor symmetric scale. Per-channel
+// scales adapt to each row's magnitude, so weight matrices whose rows differ
+// wildly in scale lose far less precision.
+func WithPerChannelWeights() LinearOption {
+	return func(o *linearOptions) { o.perChannel = true }
+}
+
+func applyLinearOptions(opts []LinearOption) linearOptions {
+	var o linearOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
 // qLinearCore holds the shared state of the quantized Linear variants:
-// per-tensor symmetric int8 weights (zero_point = 0), float64 bias, and the
-// int32-accumulating GEMM. Inference-only: Forward returns a plain tensor
-// with no autograd graph.
+// symmetric int8 weights (zero_point = 0; one scale per tensor or per output
+// row), float64 bias, and the int32-accumulating GEMM. Inference-only:
+// Forward returns a plain tensor with no autograd graph.
 type qLinearCore struct {
 	InFeatures  int
 	OutFeatures int
-	WQ          []int8  // (Out, In) row-major, symmetric int8
-	WScale      float64 // per-tensor weight scale, zero_point = 0
-	WRowSum     []int32 // per-row sums of WQ, for input zero-point correction
-	Bias        []float64
+	WQ          []int8    // (Out, In) row-major, symmetric int8
+	WScale      float64   // per-tensor weight scale; 0 when PerChannel
+	WScales     []float64 // per-output-row weight scales (len Out); in
+	// per-tensor mode every entry equals WScale.
+	PerChannel bool
+	WRowSum    []int32 // per-row sums of WQ, for input zero-point correction
+	Bias       []float64
 }
 
-func newQLinearCore(l *nn.Linear) qLinearCore {
-	in, out := l.InFeatures, l.OutFeatures
-	c := qLinearCore{InFeatures: in, OutFeatures: out}
-	c.WScale = symmetricQParams(l.Weight.Data)
-	c.WQ = make([]int8, out*in)
-	for i, v := range l.Weight.Data {
-		c.WQ[i] = quantizeValue(v, c.WScale, 0)
+// buildQLinearCore quantizes the (out, in) row-major weight w with the given
+// per-row symmetric scales (zero_point = 0) and precomputes the row sums used
+// for input zero-point correction.
+func buildQLinearCore(in, out int, w, bias, wScales []float64, perChannel bool) qLinearCore {
+	c := qLinearCore{
+		InFeatures:  in,
+		OutFeatures: out,
+		WScales:     wScales,
+		PerChannel:  perChannel,
 	}
+	if !perChannel {
+		c.WScale = wScales[0]
+	}
+	c.WQ = make([]int8, out*in)
 	c.WRowSum = make([]int32, out)
 	for o := 0; o < out; o++ {
-		var s int32
+		s := wScales[o]
+		var sum int32
 		for i := 0; i < in; i++ {
-			s += int32(c.WQ[o*in+i])
+			q := quantizeValue(w[o*in+i], s, 0)
+			c.WQ[o*in+i] = q
+			sum += int32(q)
 		}
-		c.WRowSum[o] = s
+		c.WRowSum[o] = sum
 	}
-	if l.Bias != nil {
-		c.Bias = append([]float64(nil), l.Bias.Data...)
+	if bias != nil {
+		c.Bias = append([]float64(nil), bias...)
 	}
 	return c
+}
+
+func newQLinearCore(l *nn.Linear, o linearOptions) qLinearCore {
+	in, out := l.InFeatures, l.OutFeatures
+	wScales := make([]float64, out)
+	if o.perChannel {
+		q := QuantizePerChannel(l.Weight, 0)
+		copy(wScales, q.Scales)
+	} else {
+		s := symmetricQParams(l.Weight.Data)
+		for i := range wScales {
+			wScales[i] = s
+		}
+	}
+	var bias []float64
+	if l.Bias != nil {
+		bias = l.Bias.Data
+	}
+	return buildQLinearCore(in, out, l.Weight.Data, bias, wScales, o.perChannel)
 }
 
 // forward quantizes x with the given input qparams, runs the int8 x int8 ->
 // int32 GEMM, and dequantizes with the combined scale:
 //
-//	y[b,o] = sx*sw * (sum_k xq[b,k]*wq[o,k] - zx * sum_k wq[o,k]) + bias[o]
+//	y[b,o] = sx*sw[o] * (sum_k xq[b,k]*wq[o,k] - zx * sum_k wq[o,k]) + bias[o]
 //
 // which is exact in the quantized domain because the weight zero point is 0.
+// sw[o] is the per-tensor weight scale, or the row's own scale in per-channel
+// mode.
 func (c *qLinearCore) forward(x *tensor.Tensor, inScale float64, inZeroPoint int) *tensor.Tensor {
 	origShape := x.Shape
 	feat := origShape[len(origShape)-1]
@@ -66,7 +124,6 @@ func (c *qLinearCore) forward(x *tensor.Tensor, inScale float64, inZeroPoint int
 	}
 
 	in, out := c.InFeatures, c.OutFeatures
-	scale := inScale * c.WScale
 	zx := int32(inZeroPoint)
 	y := make([]float64, batch*out)
 	for b := 0; b < batch; b++ {
@@ -77,7 +134,7 @@ func (c *qLinearCore) forward(x *tensor.Tensor, inScale float64, inZeroPoint int
 			for k := 0; k < in; k++ {
 				acc += int32(xrow[k]) * int32(wrow[k])
 			}
-			v := scale * float64(acc-zx*c.WRowSum[o])
+			v := inScale * c.WScales[o] * float64(acc-zx*c.WRowSum[o])
 			if c.Bias != nil {
 				v += c.Bias[o]
 			}
@@ -92,17 +149,19 @@ func (c *qLinearCore) forward(x *tensor.Tensor, inScale float64, inZeroPoint int
 
 // DynamicLinear is a dynamically quantized Linear, the analog of
 // torch.ao.nn.quantized.dynamic.Linear: weights are quantized once
-// (per-tensor symmetric int8), and on every Forward the input's affine
-// qparams are computed from its own min/max before the integer GEMM.
+// (symmetric int8, per-tensor by default or per-channel with
+// WithPerChannelWeights), and on every Forward the input's affine qparams are
+// computed from its own min/max before the integer GEMM.
 // Inference-only; the returned tensor carries no autograd graph.
 type DynamicLinear struct {
 	qLinearCore
 }
 
 // NewDynamicLinearFrom converts a trained float Linear into a DynamicLinear.
-// The original layer is not modified.
-func NewDynamicLinearFrom(l *nn.Linear) *DynamicLinear {
-	return &DynamicLinear{qLinearCore: newQLinearCore(l)}
+// The original layer is not modified. Pass WithPerChannelWeights() to
+// quantize the weight per output row.
+func NewDynamicLinearFrom(l *nn.Linear, opts ...LinearOption) *DynamicLinear {
+	return &DynamicLinear{qLinearCore: newQLinearCore(l, applyLinearOptions(opts))}
 }
 
 // Forward computes the quantized x @ W^T + b, deriving the input scale and
@@ -136,11 +195,12 @@ type StaticLinear struct {
 
 // NewStaticLinearFrom converts a trained float Linear using the activation
 // range recorded by obs (calibrate first by calling obs.Observe on
-// representative inputs). The original layer is not modified.
-func NewStaticLinearFrom(l *nn.Linear, obs *MinMaxObserver) *StaticLinear {
+// representative inputs). The original layer is not modified. Pass
+// WithPerChannelWeights() to quantize the weight per output row.
+func NewStaticLinearFrom(l *nn.Linear, obs *MinMaxObserver, opts ...LinearOption) *StaticLinear {
 	scale, zp := obs.ComputeQParams()
 	return &StaticLinear{
-		qLinearCore: newQLinearCore(l),
+		qLinearCore: newQLinearCore(l, applyLinearOptions(opts)),
 		InScale:     scale,
 		InZeroPoint: zp,
 	}
