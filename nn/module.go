@@ -75,6 +75,27 @@ func (b *Base) regChild(name string, c Child) {
 	b.children = append(b.children, childEntry{name: name, c: c})
 }
 
+// RegisterParam registers a trainable parameter under name and returns it.
+// Exported for custom modules defined outside this package:
+//
+//	type MyLayer struct{ nn.Base; W *tensor.Tensor }
+//	l.W = l.RegisterParam("weight", tensor.Randn(4, 4).SetRequiresGrad(true))
+func (b *Base) RegisterParam(name string, t *tensor.Tensor) *tensor.Tensor {
+	return b.reg(name, t)
+}
+
+// RegisterBuffer registers a non-trainable buffer (running statistics, ...)
+// under name and returns it. Buffers appear in Buffers(), not Parameters().
+func (b *Base) RegisterBuffer(name string, t *tensor.Tensor) *tensor.Tensor {
+	return b.regBuf(name, t)
+}
+
+// RegisterChild registers a sub-module under name, wiring its parameters,
+// buffers, and train/eval mode into this module's tree.
+func (b *Base) RegisterChild(name string, c Child) {
+	b.regChild(name, c)
+}
+
 // Parameters returns this module's direct parameters followed by every
 // child's, depth-first, in registration order.
 func (b *Base) Parameters() []*tensor.Tensor {

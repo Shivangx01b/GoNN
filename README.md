@@ -11,6 +11,18 @@
 
 A pure-Go deep learning and machine learning framework with PyTorch-style autograd, neural-network layers, optimizers, classical ML algorithms, and an optional CUDA backend.
 
+## Documentation
+
+**📚 [Step-by-step tutorials](docs/tutorials/README.md)** — a guided walkthrough of the whole framework, with runnable CPU and GPU examples:
+
+| | | |
+|---|---|---|
+| [01 Getting Started](docs/tutorials/01-getting-started.md) | [02 Tensors & Autograd](docs/tutorials/02-tensors-and-autograd.md) | [03 Building Models](docs/tutorials/03-building-models.md) |
+| [04 Training](docs/tutorials/04-training.md) | [05 Convolutional Networks](docs/tutorials/05-convolutional-networks.md) | [06 Sequence Models](docs/tutorials/06-sequence-models.md) |
+| [07 Classical ML](docs/tutorials/07-classical-ml.md) | [08 GPU Acceleration](docs/tutorials/08-gpu-acceleration.md) | [09 Extending GoNN](docs/tutorials/09-extending-gonn.md) |
+
+Runnable programs live in [`examples/`](examples); benchmark methodology and results in [`benchmark/`](benchmark).
+
 ## What is GoNN?
 
 GoNN is a single-binary, dependency-light alternative to PyTorch / tinygrad / TensorFlow, written in Go. It provides:
@@ -151,18 +163,18 @@ sched.Step()
 ```go
 import "gonn/ml"
 
-// K-means clustering
-km := ml.NewKMeans(3, 100, 1e-4)
+// K-means clustering (struct-literal configuration; zero values = defaults)
+km := &ml.KMeans{K: 3, MaxIter: 100}
 km.Fit(X)
 labels := km.Predict(X)
 
 // Random forest classification
-rf := ml.NewRandomForestClassifier(100, 10, 0)
+rf := &ml.RandomForestClassifier{NEstimators: 100, MaxDepth: 10}
 rf.Fit(Xtr, ytr)
 yhat := rf.Predict(Xte)
 
 // Gradient boosting regression
-gb := ml.NewGradientBoostingRegressor(100, 0.1, 3)
+gb := &ml.GradientBoostingRegressor{NEstimators: 100, LR: 0.1, MaxDepth: 3}
 gb.Fit(Xtr, ytr)
 ```
 
@@ -276,13 +288,16 @@ everywhere" — see the report for where it wins, ties, and loses.
 
 ```
 GoNN/
-├── tensor/        # Core Tensor + autograd
+├── docs/
+│   └── tutorials/ # Step-by-step walkthroughs (start here)
+├── tensor/        # Core Tensor + autograd + unary-op registry
 ├── nn/            # Layers, losses, init, activations as modules
-├── optim/         # Optimizers + LR schedulers
+├── optim/         # Optimizers, param groups, clipping, LR schedulers
 ├── ml/            # Classical ML algorithms
 ├── data/          # Datasets, DataLoader, transforms
-├── backend/       # CPU (gonum BLAS) / CUDA backend contract
-│   └── cuda/      # CUDA kernels + fused flash-attention (build tag `cuda`)
+├── backend/       # Compute backend contract (CPU default)
+│   ├── cuda/      # CUDA kernels + fused flash-attention (build tag `cuda`)
+│   └── opencl/    # OpenCL kernels (build tag `opencl`)
 ├── benchmark/     # Cross-framework benchmarks + Docker GPU build + report
 ├── examples/      # Runnable demos
 └── main.go        # Top-level smoke test
