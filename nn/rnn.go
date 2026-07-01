@@ -20,9 +20,11 @@ import (
 type RNNOpt func(*rnnOpts)
 
 type rnnOpts struct {
-	layers int
-	bidir  bool
-	relu   bool
+	layers  int
+	bidir   bool
+	relu    bool
+	dropout float64
+	proj    int
 }
 
 // WithLayers sets the number of stacked layers (default 1).
@@ -37,6 +39,19 @@ func WithBidirectional() RNNOpt { return func(o *rnnOpts) { o.bidir = true } }
 // nonlinearities are fixed.
 func WithReLU() RNNOpt { return func(o *rnnOpts) { o.relu = true } }
 
+// WithRNNDropout applies dropout with probability p to the output of every
+// layer except the last (PyTorch RNN/LSTM/GRU dropout semantics). Active only
+// in Training(); identity in Eval(). With p == 0 (the default) or a single
+// layer no Dropout modules are constructed at all, so the module tree is
+// identical to the historical one.
+func WithRNNDropout(p float64) RNNOpt { return func(o *rnnOpts) { o.dropout = p } }
+
+// WithProjSize enables LSTM output projections (PyTorch proj_size): each cell
+// gains W_hr = Linear(hidden, proj, no bias) and emits h_t = W_hr(o * tanh(c)),
+// so the hidden output (and the recurrent Whh input) has size proj while the
+// cell state keeps size hidden. LSTM/LSTMCell only; requires 0 < proj < hidden.
+func WithProjSize(p int) RNNOpt { return func(o *rnnOpts) { o.proj = p } }
+
 func resolveRNNOpts(opts []RNNOpt) rnnOpts {
 	o := rnnOpts{layers: 1}
 	for _, fn := range opts {
@@ -45,7 +60,51 @@ func resolveRNNOpts(opts []RNNOpt) rnnOpts {
 	if o.layers < 1 {
 		panic(fmt.Sprintf("nn: rnn layers must be >= 1, got %d", o.layers))
 	}
+	if o.dropout < 0 || o.dropout > 1 {
+		panic(fmt.Sprintf("nn: rnn dropout must be in [0, 1], got %g", o.dropout))
+	}
+	if o.proj < 0 {
+		panic(fmt.Sprintf("nn: rnn proj size must be >= 0, got %d", o.proj))
+	}
 	return o
+}
+
+// checkProjSize validates a WithProjSize value against the hidden size (and
+// rejects it entirely for non-LSTM kinds).
+func checkProjSize(kind string, proj, hidden int) {
+	if proj == 0 {
+		return
+	}
+	if kind != "LSTM" && kind != "LSTMCell" {
+		panic(fmt.Sprintf("nn: WithProjSize applies only to LSTM/LSTMCell, not %s", kind))
+	}
+	if proj >= hidden {
+		panic(fmt.Sprintf("nn: %s proj size must satisfy 0 < proj < hidden, got proj=%d hidden=%d", kind, proj, hidden))
+	}
+}
+
+// makeInterLayerDropout builds the per-layer Dropout children used by
+// WithRNNDropout: one per layer boundary (layers-1 total), or nil when p == 0
+// or there is a single layer — in that case the module tree is untouched.
+func makeInterLayerDropout(b *Base, p float64, layers int) []*Dropout {
+	if p <= 0 || layers < 2 {
+		return nil
+	}
+	ds := make([]*Dropout, layers-1)
+	for i := range ds {
+		ds[i] = NewDropout(p)
+		b.regChild("dropout."+strconv.Itoa(i), ds[i])
+	}
+	return ds
+}
+
+// applyInterLayerDropout applies ds[li] to a layer's output when li is not the
+// last layer (PyTorch semantics: no dropout after the final layer).
+func applyInterLayerDropout(ds []*Dropout, li, layers int, x *tensor.Tensor) *tensor.Tensor {
+	if ds == nil || li >= layers-1 {
+		return x
+	}
+	return ds[li].Forward(x)
 }
 
 // layerInputSize returns the input size of stack layer i.
@@ -77,10 +136,12 @@ type RNNCell struct {
 }
 
 // NewRNNCell creates an RNNCell. NewRNNCell(in, hidden) defaults to tanh;
-// pass WithReLU() for the ReLU nonlinearity. WithLayers/WithBidirectional do
-// not apply to a single cell and are ignored.
+// pass WithReLU() for the ReLU nonlinearity. WithLayers/WithBidirectional/
+// WithRNNDropout do not apply to a single cell and are ignored; WithProjSize
+// is LSTM-only and panics.
 func NewRNNCell(in, hidden int, opts ...RNNOpt) *RNNCell {
 	o := resolveRNNOpts(opts)
+	checkProjSize("RNNCell", o.proj, hidden)
 	c := &RNNCell{
 		InputSize:  in,
 		HiddenSize: hidden,
@@ -117,30 +178,61 @@ type LSTMCell struct {
 	Base
 	InputSize  int
 	HiddenSize int
-	Wih        *Linear // x -> 4H (i, f, g, o)
-	Whh        *Linear // h -> 4H
+	// ProjSize > 0 enables the PyTorch proj_size projection: the emitted
+	// hidden state (and Whh's input) has size ProjSize while the cell state
+	// stays HiddenSize. Zero (the default) means no projection.
+	ProjSize int
+	Wih      *Linear // x -> 4H (i, f, g, o)
+	Whh      *Linear // h -> 4H
+	Whr      *Linear // (ProjSize > 0 only) hidden -> proj, no bias
 }
 
-// NewLSTMCell creates an LSTMCell.
-func NewLSTMCell(in, hidden int) *LSTMCell {
+// NewLSTMCell creates an LSTMCell. Pass WithProjSize(p) (0 < p < hidden) for
+// the PyTorch proj_size variant: h_t = W_hr(o * tanh(c)) with W_hr =
+// Linear(hidden, proj, no bias). Other stack options are ignored. The default
+// (no projection) draws the identical RNG sequence as the historical
+// constructor.
+func NewLSTMCell(in, hidden int, opts ...RNNOpt) *LSTMCell {
+	o := resolveRNNOpts(opts)
+	checkProjSize("LSTMCell", o.proj, hidden)
+	hOut := hidden
+	if o.proj > 0 {
+		hOut = o.proj
+	}
 	c := &LSTMCell{
 		InputSize:  in,
 		HiddenSize: hidden,
+		ProjSize:   o.proj,
 		Wih:        NewLinear(in, 4*hidden, true),
-		Whh:        NewLinear(hidden, 4*hidden, false),
+		Whh:        NewLinear(hOut, 4*hidden, false),
+	}
+	if o.proj > 0 {
+		c.Whr = NewLinear(hidden, o.proj, false)
 	}
 	c.regChild("wih", c.Wih)
 	c.regChild("whh", c.Whh)
+	if c.Whr != nil {
+		c.regChild("whr", c.Whr)
+	}
 	return c
 }
 
+// hiddenOut returns the emitted hidden-state size: ProjSize when projecting,
+// else HiddenSize.
+func (c *LSTMCell) hiddenOut() int {
+	if c.ProjSize > 0 {
+		return c.ProjSize
+	}
+	return c.HiddenSize
+}
+
 // Forward consumes one timestep. x: (B, in); state may be nil for t=0.
-// Returns new state (h_t, c_t).
+// Returns new state (h_t, c_t): h_t is (B, hiddenOut()), c_t is (B, hidden).
 func (c *LSTMCell) Forward(x *tensor.Tensor, state *LSTMState) *LSTMState {
 	B := x.Shape[0]
 	H := c.HiddenSize
 	if state == nil {
-		state = &LSTMState{H: tensor.Zeros(B, H), C: tensor.Zeros(B, H)}
+		state = &LSTMState{H: tensor.Zeros(B, c.hiddenOut()), C: tensor.Zeros(B, H)}
 	}
 	gates := c.Wih.Forward(x).Add(c.Whh.Forward(state.H)) // (B, 4H)
 	i := sliceCol(gates, 0, H).Sigmoid()
@@ -149,6 +241,9 @@ func (c *LSTMCell) Forward(x *tensor.Tensor, state *LSTMState) *LSTMState {
 	o := sliceCol(gates, 3*H, 4*H).Sigmoid()
 	cNew := f.Mul(state.C).Add(i.Mul(g))
 	hNew := o.Mul(cNew.Tanh())
+	if c.Whr != nil {
+		hNew = c.Whr.Forward(hNew) // (B, proj)
+	}
 	return &LSTMState{H: hNew, C: cNew}
 }
 
@@ -213,8 +308,8 @@ func runRNNDir(cell *RNNCell, x *tensor.Tensor, reverse bool, h0 *tensor.Tensor)
 }
 
 // runLSTMDir runs one LSTMCell over x in either direction, starting from
-// state0 (nil = zeros). Returns the full sequence (B, T, H) and the final
-// state.
+// state0 (nil = zeros). Returns the full sequence (B, T, hiddenOut) and the
+// final state.
 func runLSTMDir(cell *LSTMCell, x *tensor.Tensor, reverse bool, state0 *LSTMState) (*tensor.Tensor, *LSTMState) {
 	B, T := x.Shape[0], x.Shape[1]
 	outs := make([]*tensor.Tensor, T)
@@ -227,7 +322,28 @@ func runLSTMDir(cell *LSTMCell, x *tensor.Tensor, reverse bool, state0 *LSTMStat
 		state = cell.Forward(sliceTime(x, t), state)
 		outs[t] = state.H
 	}
-	return stackTime(outs, B, T, cell.HiddenSize), state
+	return stackTime(outs, B, T, cell.hiddenOut()), state
+}
+
+// runLSTMDirC is runLSTMDir plus a stacked (B, T, hidden) sequence of the
+// per-step cell states, needed by ForwardPacked to gather each sequence's
+// c at its true last step. Used only on the packed path so the default
+// Forward/ForwardWithState graphs stay untouched.
+func runLSTMDirC(cell *LSTMCell, x *tensor.Tensor, reverse bool, state0 *LSTMState) (*tensor.Tensor, *tensor.Tensor, *LSTMState) {
+	B, T := x.Shape[0], x.Shape[1]
+	outs := make([]*tensor.Tensor, T)
+	cs := make([]*tensor.Tensor, T)
+	state := state0
+	for step := 0; step < T; step++ {
+		t := step
+		if reverse {
+			t = T - 1 - step
+		}
+		state = cell.Forward(sliceTime(x, t), state)
+		outs[t] = state.H
+		cs[t] = state.C
+	}
+	return stackTime(outs, B, T, cell.hiddenOut()), stackTime(cs, B, T, cell.HiddenSize), state
 }
 
 // runGRUDir runs one GRUCell over x in either direction, starting from h0
@@ -288,6 +404,7 @@ type RNN struct {
 	Base
 	Cells         []*RNNCell // forward direction, one per layer
 	BackCells     []*RNNCell // reverse direction (nil if !Bidirectional)
+	Dropouts      []*Dropout // inter-layer dropout (nil unless WithRNNDropout(p>0) and layers > 1)
 	NumLayers     int
 	HiddenSize    int
 	Bidirectional bool
@@ -297,6 +414,7 @@ type RNN struct {
 // NewRNN(in, hidden, WithLayers(2), WithBidirectional()).
 func NewRNN(in, hidden int, opts ...RNNOpt) *RNN {
 	o := resolveRNNOpts(opts)
+	checkProjSize("RNN", o.proj, hidden)
 	r := &RNN{NumLayers: o.layers, HiddenSize: hidden, Bidirectional: o.bidir}
 	r.Cells = make([]*RNNCell, o.layers)
 	if o.bidir {
@@ -319,6 +437,7 @@ func NewRNN(in, hidden int, opts ...RNNOpt) *RNN {
 	for i, c := range r.BackCells {
 		r.regChild("backcells."+strconv.Itoa(i), c)
 	}
+	r.Dropouts = makeInterLayerDropout(&r.Base, o.dropout, o.layers)
 	return r
 }
 
@@ -331,11 +450,11 @@ func (r *RNN) Forward(x *tensor.Tensor) *tensor.Tensor {
 	for li := 0; li < r.NumLayers; li++ {
 		fwd, _ := runRNNDir(r.Cells[li], cur, false, nil)
 		if !r.Bidirectional {
-			cur = fwd
+			cur = applyInterLayerDropout(r.Dropouts, li, r.NumLayers, fwd)
 			continue
 		}
 		bwd, _ := runRNNDir(r.BackCells[li], cur, true, nil)
-		cur = tensor.Concat(2, fwd, bwd)
+		cur = applyInterLayerDropout(r.Dropouts, li, r.NumLayers, tensor.Concat(2, fwd, bwd))
 	}
 	return cur
 }
@@ -362,12 +481,12 @@ func (r *RNN) ForwardWithState(x, h0 *tensor.Tensor) (*tensor.Tensor, *tensor.Te
 		fwd, hF := runRNNDir(r.Cells[li], cur, false, stateSlice(h0, li*D, B, r.HiddenSize))
 		finals[li*D] = hF
 		if !r.Bidirectional {
-			cur = fwd
+			cur = applyInterLayerDropout(r.Dropouts, li, r.NumLayers, fwd)
 			continue
 		}
 		bwd, hB := runRNNDir(r.BackCells[li], cur, true, stateSlice(h0, li*D+1, B, r.HiddenSize))
 		finals[li*D+1] = hB
-		cur = tensor.Concat(2, fwd, bwd)
+		cur = applyInterLayerDropout(r.Dropouts, li, r.NumLayers, tensor.Concat(2, fwd, bwd))
 	}
 	return cur, stackStates(finals)
 }
@@ -376,26 +495,38 @@ func (r *RNN) ForwardWithState(x, h0 *tensor.Tensor) (*tensor.Tensor, *tensor.Te
 // Default: one layer, unidirectional.
 type LSTM struct {
 	Base
-	Cells         []*LSTMCell
-	BackCells     []*LSTMCell
-	NumLayers     int
-	HiddenSize    int
+	Cells      []*LSTMCell
+	BackCells  []*LSTMCell
+	Dropouts   []*Dropout // inter-layer dropout (nil unless WithRNNDropout(p>0) and layers > 1)
+	NumLayers  int
+	HiddenSize int
+	// ProjSize > 0 means every cell projects its hidden output to ProjSize
+	// (PyTorch proj_size); the cell states keep HiddenSize.
+	ProjSize      int
 	Bidirectional bool
 }
 
-// NewLSTM builds an LSTM stack.
+// NewLSTM builds an LSTM stack. WithProjSize(p) (0 < p < hidden) enables
+// PyTorch proj_size: outputs and hN have feature size p (2p bidirectional)
+// while cN keeps the hidden size.
 func NewLSTM(in, hidden int, opts ...RNNOpt) *LSTM {
 	o := resolveRNNOpts(opts)
-	l := &LSTM{NumLayers: o.layers, HiddenSize: hidden, Bidirectional: o.bidir}
+	checkProjSize("LSTM", o.proj, hidden)
+	l := &LSTM{NumLayers: o.layers, HiddenSize: hidden, ProjSize: o.proj, Bidirectional: o.bidir}
 	l.Cells = make([]*LSTMCell, o.layers)
 	if o.bidir {
 		l.BackCells = make([]*LSTMCell, o.layers)
 	}
+	var cellOpts []RNNOpt
+	if o.proj > 0 {
+		cellOpts = append(cellOpts, WithProjSize(o.proj))
+	}
+	hOut := l.hiddenOut()
 	for i := 0; i < o.layers; i++ {
-		layerIn := layerInputSize(i, in, hidden, o.bidir)
-		l.Cells[i] = NewLSTMCell(layerIn, hidden)
+		layerIn := layerInputSize(i, in, hOut, o.bidir)
+		l.Cells[i] = NewLSTMCell(layerIn, hidden, cellOpts...)
 		if o.bidir {
-			l.BackCells[i] = NewLSTMCell(layerIn, hidden)
+			l.BackCells[i] = NewLSTMCell(layerIn, hidden, cellOpts...)
 		}
 	}
 	for i, c := range l.Cells {
@@ -404,7 +535,17 @@ func NewLSTM(in, hidden int, opts ...RNNOpt) *LSTM {
 	for i, c := range l.BackCells {
 		l.regChild("backcells."+strconv.Itoa(i), c)
 	}
+	l.Dropouts = makeInterLayerDropout(&l.Base, o.dropout, o.layers)
 	return l
+}
+
+// hiddenOut returns the per-direction output feature size: ProjSize when
+// projecting, else HiddenSize.
+func (l *LSTM) hiddenOut() int {
+	if l.ProjSize > 0 {
+		return l.ProjSize
+	}
+	return l.HiddenSize
 }
 
 // Forward runs the stack. x: (B, T, F).
@@ -416,20 +557,22 @@ func (l *LSTM) Forward(x *tensor.Tensor) *tensor.Tensor {
 	for li := 0; li < l.NumLayers; li++ {
 		fwd, _ := runLSTMDir(l.Cells[li], cur, false, nil)
 		if !l.Bidirectional {
-			cur = fwd
+			cur = applyInterLayerDropout(l.Dropouts, li, l.NumLayers, fwd)
 			continue
 		}
 		bwd, _ := runLSTMDir(l.BackCells[li], cur, true, nil)
-		cur = tensor.Concat(2, fwd, bwd)
+		cur = applyInterLayerDropout(l.Dropouts, li, l.NumLayers, tensor.Concat(2, fwd, bwd))
 	}
 	return cur
 }
 
 // ForwardWithState runs the stack from explicit initial (h0, c0) and also
-// returns the final (hN, cN), PyTorch style. x: (B, T, F); h0 and c0:
-// (numLayers*numDirections, B, H) or nil for zeros (they must be both nil or
-// both set). Layout matches PyTorch: index layer*numDirections + direction.
-// With nil state the sequence output equals Forward(x) exactly.
+// returns the final (hN, cN), PyTorch style. x: (B, T, F); h0:
+// (numLayers*numDirections, B, hiddenOut) and c0: (numLayers*numDirections,
+// B, H), or nil for zeros (they must be both nil or both set) — with
+// WithProjSize the h states have feature size proj while the c states keep
+// the hidden size. Layout matches PyTorch: index layer*numDirections +
+// direction. With nil state the sequence output equals Forward(x) exactly.
 func (l *LSTM) ForwardWithState(x, h0, c0 *tensor.Tensor) (*tensor.Tensor, *tensor.Tensor, *tensor.Tensor) {
 	if len(x.Shape) != 3 {
 		panic("LSTM.ForwardWithState: expected (B, T, F)")
@@ -440,8 +583,9 @@ func (l *LSTM) ForwardWithState(x, h0, c0 *tensor.Tensor) (*tensor.Tensor, *tens
 	B := x.Shape[0]
 	D := numDirections(l.Bidirectional)
 	LD := l.NumLayers * D
+	hOut := l.hiddenOut()
 	if h0 != nil {
-		checkStateShape("LSTM.ForwardWithState", h0, LD, B, l.HiddenSize)
+		checkStateShape("LSTM.ForwardWithState", h0, LD, B, hOut)
 		checkStateShape("LSTM.ForwardWithState", c0, LD, B, l.HiddenSize)
 	}
 	initState := func(idx int) *LSTMState {
@@ -449,7 +593,7 @@ func (l *LSTM) ForwardWithState(x, h0, c0 *tensor.Tensor) (*tensor.Tensor, *tens
 			return nil
 		}
 		return &LSTMState{
-			H: stateSlice(h0, idx, B, l.HiddenSize),
+			H: stateSlice(h0, idx, B, hOut),
 			C: stateSlice(c0, idx, B, l.HiddenSize),
 		}
 	}
@@ -460,12 +604,12 @@ func (l *LSTM) ForwardWithState(x, h0, c0 *tensor.Tensor) (*tensor.Tensor, *tens
 		fwd, stF := runLSTMDir(l.Cells[li], cur, false, initState(li*D))
 		finalH[li*D], finalC[li*D] = stF.H, stF.C
 		if !l.Bidirectional {
-			cur = fwd
+			cur = applyInterLayerDropout(l.Dropouts, li, l.NumLayers, fwd)
 			continue
 		}
 		bwd, stB := runLSTMDir(l.BackCells[li], cur, true, initState(li*D+1))
 		finalH[li*D+1], finalC[li*D+1] = stB.H, stB.C
-		cur = tensor.Concat(2, fwd, bwd)
+		cur = applyInterLayerDropout(l.Dropouts, li, l.NumLayers, tensor.Concat(2, fwd, bwd))
 	}
 	return cur, stackStates(finalH), stackStates(finalC)
 }
@@ -476,6 +620,7 @@ type GRU struct {
 	Base
 	Cells         []*GRUCell
 	BackCells     []*GRUCell
+	Dropouts      []*Dropout // inter-layer dropout (nil unless WithRNNDropout(p>0) and layers > 1)
 	NumLayers     int
 	HiddenSize    int
 	Bidirectional bool
@@ -484,6 +629,7 @@ type GRU struct {
 // NewGRU builds a GRU stack.
 func NewGRU(in, hidden int, opts ...RNNOpt) *GRU {
 	o := resolveRNNOpts(opts)
+	checkProjSize("GRU", o.proj, hidden)
 	g := &GRU{NumLayers: o.layers, HiddenSize: hidden, Bidirectional: o.bidir}
 	g.Cells = make([]*GRUCell, o.layers)
 	if o.bidir {
@@ -502,6 +648,7 @@ func NewGRU(in, hidden int, opts ...RNNOpt) *GRU {
 	for i, c := range g.BackCells {
 		g.regChild("backcells."+strconv.Itoa(i), c)
 	}
+	g.Dropouts = makeInterLayerDropout(&g.Base, o.dropout, o.layers)
 	return g
 }
 
@@ -514,11 +661,11 @@ func (g *GRU) Forward(x *tensor.Tensor) *tensor.Tensor {
 	for li := 0; li < g.NumLayers; li++ {
 		fwd, _ := runGRUDir(g.Cells[li], cur, false, nil)
 		if !g.Bidirectional {
-			cur = fwd
+			cur = applyInterLayerDropout(g.Dropouts, li, g.NumLayers, fwd)
 			continue
 		}
 		bwd, _ := runGRUDir(g.BackCells[li], cur, true, nil)
-		cur = tensor.Concat(2, fwd, bwd)
+		cur = applyInterLayerDropout(g.Dropouts, li, g.NumLayers, tensor.Concat(2, fwd, bwd))
 	}
 	return cur
 }
@@ -545,12 +692,126 @@ func (g *GRU) ForwardWithState(x, h0 *tensor.Tensor) (*tensor.Tensor, *tensor.Te
 		fwd, hF := runGRUDir(g.Cells[li], cur, false, stateSlice(h0, li*D, B, g.HiddenSize))
 		finals[li*D] = hF
 		if !g.Bidirectional {
-			cur = fwd
+			cur = applyInterLayerDropout(g.Dropouts, li, g.NumLayers, fwd)
 			continue
 		}
 		bwd, hB := runGRUDir(g.BackCells[li], cur, true, stateSlice(h0, li*D+1, B, g.HiddenSize))
 		finals[li*D+1] = hB
-		cur = tensor.Concat(2, fwd, bwd)
+		cur = applyInterLayerDropout(g.Dropouts, li, g.NumLayers, tensor.Concat(2, fwd, bwd))
 	}
 	return cur, stackStates(finals)
+}
+
+// ============================================================================
+// Packed-sequence forwards
+// ============================================================================
+//
+// DEVIATION (padded-storage adaptation): PackedSequence stores padded data +
+// lengths, so ForwardPacked runs the ordinary padded forward and then
+// (a) zeroes the outputs at t >= length_i (differentiable 0/1 mask) and
+// (b) gathers each sequence's final state at its true last step
+// t = length_i - 1 per layer. For a UNIDIRECTIONAL stack this is exactly
+// equivalent to PyTorch's packed evaluation: causality guarantees every
+// valid timestep never sees a padded step.
+//
+// Bidirectional stacks PANIC: PyTorch's packed reverse pass starts at each
+// sequence's own last element, which padded evaluation cannot reproduce (the
+// reverse cell here would start at t = Tmax-1, i.e. inside the padding).
+// Use fixed-length batches (Forward/ForwardWithState) for bidirectional
+// stacks.
+
+// packedBidirMsg explains the bidirectional ForwardPacked panic.
+const packedBidirMsg = "bidirectional packed input is not supported: with padded storage the " +
+	"reverse direction would start at t = Tmax-1 (inside the padding) instead of each " +
+	"sequence's own last element, so it cannot match PyTorch's packed reverse pass; " +
+	"use fixed-length batches (Forward/ForwardWithState) for bidirectional stacks"
+
+// packedResult re-wraps a masked batch-first output (B, T, H) in the caller's
+// layout with a fresh copy of lengths.
+func packedResult(masked *tensor.Tensor, ps PackedSequence) PackedSequence {
+	out := masked
+	if !ps.BatchFirst {
+		out = masked.Permute(1, 0, 2)
+	}
+	lengths := make([]int, len(ps.Lengths))
+	copy(lengths, ps.Lengths)
+	return PackedSequence{Padded: out, Lengths: lengths, BatchFirst: ps.BatchFirst}
+}
+
+// ForwardPacked runs the stack over a PackedSequence (unidirectional only —
+// see the deviation note above; bidirectional stacks panic). It returns the
+// packed output — padded positions t >= length_i zeroed, layout matching
+// ps.BatchFirst — and hN of shape (numLayers, B, H) taken at each sequence's
+// true last step. Inter-layer dropout (WithRNNDropout) applies as in Forward;
+// hN is gathered from the pre-dropout layer outputs, PyTorch style.
+func (r *RNN) ForwardPacked(ps PackedSequence) (PackedSequence, *tensor.Tensor) {
+	if r.Bidirectional {
+		panic("RNN.ForwardPacked: " + packedBidirMsg)
+	}
+	ps.checkAgainst("RNN.ForwardPacked")
+	x := ps.batchFirstPadded() // (B, T, F)
+	B, T := x.Shape[0], x.Shape[1]
+	finals := make([]*tensor.Tensor, r.NumLayers)
+	cur := x
+	last := x
+	for li := 0; li < r.NumLayers; li++ {
+		out, _ := runRNNDir(r.Cells[li], cur, false, nil)
+		finals[li] = gatherLastSteps(out, ps.Lengths)
+		last = out
+		cur = applyInterLayerDropout(r.Dropouts, li, r.NumLayers, out)
+	}
+	masked := last.Mul(packedOutputMask(B, T, ps.Lengths))
+	return packedResult(masked, ps), stackStates(finals)
+}
+
+// ForwardPacked runs the LSTM stack over a PackedSequence (unidirectional
+// only — see the deviation note above; bidirectional stacks panic). It
+// returns the packed output (padded positions zeroed), hN of shape
+// (numLayers, B, hiddenOut) and cN of shape (numLayers, B, H), both taken at
+// each sequence's true last step. With WithProjSize the h states have feature
+// size proj while the c states keep the hidden size.
+func (l *LSTM) ForwardPacked(ps PackedSequence) (PackedSequence, *tensor.Tensor, *tensor.Tensor) {
+	if l.Bidirectional {
+		panic("LSTM.ForwardPacked: " + packedBidirMsg)
+	}
+	ps.checkAgainst("LSTM.ForwardPacked")
+	x := ps.batchFirstPadded() // (B, T, F)
+	B, T := x.Shape[0], x.Shape[1]
+	finalH := make([]*tensor.Tensor, l.NumLayers)
+	finalC := make([]*tensor.Tensor, l.NumLayers)
+	cur := x
+	last := x
+	for li := 0; li < l.NumLayers; li++ {
+		out, cs, _ := runLSTMDirC(l.Cells[li], cur, false, nil)
+		finalH[li] = gatherLastSteps(out, ps.Lengths)
+		finalC[li] = gatherLastSteps(cs, ps.Lengths)
+		last = out
+		cur = applyInterLayerDropout(l.Dropouts, li, l.NumLayers, out)
+	}
+	masked := last.Mul(packedOutputMask(B, T, ps.Lengths))
+	return packedResult(masked, ps), stackStates(finalH), stackStates(finalC)
+}
+
+// ForwardPacked runs the GRU stack over a PackedSequence (unidirectional only
+// — see the deviation note above; bidirectional stacks panic). It returns the
+// packed output (padded positions zeroed) and hN of shape (numLayers, B, H)
+// taken at each sequence's true last step.
+func (g *GRU) ForwardPacked(ps PackedSequence) (PackedSequence, *tensor.Tensor) {
+	if g.Bidirectional {
+		panic("GRU.ForwardPacked: " + packedBidirMsg)
+	}
+	ps.checkAgainst("GRU.ForwardPacked")
+	x := ps.batchFirstPadded() // (B, T, F)
+	B, T := x.Shape[0], x.Shape[1]
+	finals := make([]*tensor.Tensor, g.NumLayers)
+	cur := x
+	last := x
+	for li := 0; li < g.NumLayers; li++ {
+		out, _ := runGRUDir(g.Cells[li], cur, false, nil)
+		finals[li] = gatherLastSteps(out, ps.Lengths)
+		last = out
+		cur = applyInterLayerDropout(g.Dropouts, li, g.NumLayers, out)
+	}
+	masked := last.Mul(packedOutputMask(B, T, ps.Lengths))
+	return packedResult(masked, ps), stackStates(finals)
 }

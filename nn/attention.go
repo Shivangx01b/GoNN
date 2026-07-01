@@ -15,24 +15,59 @@ type MultiHeadAttention struct {
 	EmbedDim int
 	NumHeads int
 	HeadDim  int
-	QProj    *Linear
-	KProj    *Linear
-	VProj    *Linear
-	OutProj  *Linear
+	// KDim/VDim are the key/value input feature sizes (PyTorch kdim/vdim).
+	// Zero means EmbedDim (the default self-attention configuration).
+	KDim    int
+	VDim    int
+	QProj   *Linear
+	KProj   *Linear
+	VProj   *Linear
+	OutProj *Linear
 }
 
+// MHAOpt configures NewMultiHeadAttention.
+type MHAOpt func(*mhaOpts)
+
+type mhaOpts struct {
+	kdim int
+	vdim int
+}
+
+// WithKDim sets the key input feature size (PyTorch kdim): KProj becomes
+// Linear(kdim, embedDim). Default is embedDim.
+func WithKDim(k int) MHAOpt { return func(o *mhaOpts) { o.kdim = k } }
+
+// WithVDim sets the value input feature size (PyTorch vdim): VProj becomes
+// Linear(vdim, embedDim). Default is embedDim.
+func WithVDim(v int) MHAOpt { return func(o *mhaOpts) { o.vdim = v } }
+
 // NewMultiHeadAttention builds an MHA with embed_dim split across num_heads.
-func NewMultiHeadAttention(embedDim, numHeads int) *MultiHeadAttention {
+// Optional WithKDim/WithVDim set distinct key/value input feature sizes
+// (PyTorch kdim/vdim); by default both equal embedDim, which draws the exact
+// RNG sequence of the historical two-argument constructor.
+func NewMultiHeadAttention(embedDim, numHeads int, opts ...MHAOpt) *MultiHeadAttention {
 	if embedDim%numHeads != 0 {
 		panic("MultiHeadAttention: embedDim must be divisible by numHeads")
+	}
+	o := mhaOpts{kdim: embedDim, vdim: embedDim}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	if o.kdim < 1 {
+		panic(fmt.Sprintf("MultiHeadAttention: kdim must be >= 1, got %d", o.kdim))
+	}
+	if o.vdim < 1 {
+		panic(fmt.Sprintf("MultiHeadAttention: vdim must be >= 1, got %d", o.vdim))
 	}
 	m := &MultiHeadAttention{
 		EmbedDim: embedDim,
 		NumHeads: numHeads,
 		HeadDim:  embedDim / numHeads,
+		KDim:     o.kdim,
+		VDim:     o.vdim,
 		QProj:    NewLinear(embedDim, embedDim, true),
-		KProj:    NewLinear(embedDim, embedDim, true),
-		VProj:    NewLinear(embedDim, embedDim, true),
+		KProj:    NewLinear(o.kdim, embedDim, true),
+		VProj:    NewLinear(o.vdim, embedDim, true),
 		OutProj:  NewLinear(embedDim, embedDim, true),
 	}
 	m.regChild("qproj", m.QProj)
@@ -42,9 +77,35 @@ func NewMultiHeadAttention(embedDim, numHeads int) *MultiHeadAttention {
 	return m
 }
 
+// checkQKVDims validates the q/k/v input feature dims against EmbedDim and
+// KDim/VDim. Zero KDim/VDim (struct-literal construction) fall back to
+// EmbedDim, preserving historical behavior.
+func (m *MultiHeadAttention) checkQKVDims(q, k, v *tensor.Tensor) {
+	kd, vd := m.KDim, m.VDim
+	if kd == 0 {
+		kd = m.EmbedDim
+	}
+	if vd == 0 {
+		vd = m.EmbedDim
+	}
+	if len(q.Shape) != 3 || q.Shape[2] != m.EmbedDim {
+		panic(fmt.Sprintf("MultiHeadAttention: q shape %v, want (B, Tq, %d)", q.Shape, m.EmbedDim))
+	}
+	if len(k.Shape) != 3 || k.Shape[2] != kd {
+		panic(fmt.Sprintf("MultiHeadAttention: k shape %v, want (B, Tk, kdim=%d)", k.Shape, kd))
+	}
+	if len(v.Shape) != 3 || v.Shape[2] != vd {
+		panic(fmt.Sprintf("MultiHeadAttention: v shape %v, want (B, Tk, vdim=%d)", v.Shape, vd))
+	}
+	if k.Shape[1] != v.Shape[1] {
+		panic(fmt.Sprintf("MultiHeadAttention: k and v sequence lengths differ (%d vs %d)", k.Shape[1], v.Shape[1]))
+	}
+}
+
 // Forward computes MHA. q,k,v shapes: (batch, seq, embed). If causal is true,
 // applies a causal mask (upper-triangular set to -inf before softmax).
 func (m *MultiHeadAttention) Forward(q, k, v *tensor.Tensor, causal bool) *tensor.Tensor {
+	m.checkQKVDims(q, k, v)
 	B, Tq, _ := q.Shape[0], q.Shape[1], q.Shape[2]
 	Tk := k.Shape[1]
 	H := m.NumHeads
@@ -96,6 +157,7 @@ func (m *MultiHeadAttention) Forward(q, k, v *tensor.Tensor, causal bool) *tenso
 // (differentiable) Forward when the fused kernel is unavailable (non-cuda
 // build), when HeadDim != 64 (kernel specialization), or when Tq != Tk.
 func (m *MultiHeadAttention) ForwardFused(q, k, v *tensor.Tensor, causal bool) *tensor.Tensor {
+	m.checkQKVDims(q, k, v)
 	B, Tq, _ := q.Shape[0], q.Shape[1], q.Shape[2]
 	Tk := k.Shape[1]
 	H, D := m.NumHeads, m.HeadDim
@@ -246,6 +308,7 @@ func (m *MultiHeadAttention) ForwardMasked(q, k, v *tensor.Tensor, opts ...AttnO
 		fn(&o)
 	}
 
+	m.checkQKVDims(q, k, v)
 	B, Tq, _ := q.Shape[0], q.Shape[1], q.Shape[2]
 	Tk := k.Shape[1]
 	H := m.NumHeads
