@@ -138,6 +138,9 @@ func main() {
 		return 0.5 * v * (1 + math.Tanh(0.7978845608028654*(v+0.044715*v*v*v)))
 	}, 1e-12)
 	run1("silu", backend.UnarySiLU, x, func(v float64) float64 { return v / (1 + math.Exp(-v)) }, 1e-12)
+	run1("gelu_exact", backend.UnaryGELUExact, x, func(v float64) float64 {
+		return 0.5 * v * (1 + math.Erf(v/math.Sqrt2))
+	}, 1e-12)
 
 	run2 := func(name string, kind backend.BinaryKind, f func(a, b float64) float64) {
 		got := make([]float64, len(x))
