@@ -23,6 +23,8 @@ A pure-Go deep learning and machine learning framework with PyTorch-style autogr
 
 Runnable programs live in [`examples/`](examples); benchmark methodology and results in [`benchmark/`](benchmark).
 
+**📋 [PyTorch parity matrix](docs/PYTORCH_PARITY.md)** — the complete `torch.nn` catalogue mapped to GoNN: what's implemented with exact semantics, what's a documented Go adaptation (hooks, DataParallel/DDP, quantization, lazy modules), and the short list of remaining gaps.
+
 ## What is GoNN?
 
 GoNN is a single-binary, dependency-light alternative to PyTorch / tinygrad / TensorFlow, written in Go. It provides:
