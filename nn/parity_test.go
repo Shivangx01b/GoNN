@@ -373,15 +373,18 @@ func TestModuleParity(t *testing.T) {
 		return
 	}
 
-	want, err := os.ReadFile(parityGolden)
+	wantBytes, err := os.ReadFile(parityGolden)
 	if err != nil {
 		t.Fatalf("read golden (run with GONN_UPDATE_GOLDEN=1 to create): %v", err)
 	}
-	if got == string(want) {
+	// Normalize line endings: git autocrlf checkouts on Windows materialize
+	// the golden file with CRLF while the generated signature uses LF.
+	want := strings.ReplaceAll(string(wantBytes), "\r\n", "\n")
+	if got == want {
 		return
 	}
 	gotLines := strings.Split(strings.TrimRight(got, "\n"), "\n")
-	wantLines := strings.Split(strings.TrimRight(string(want), "\n"), "\n")
+	wantLines := strings.Split(strings.TrimRight(want, "\n"), "\n")
 	for i := 0; i < len(gotLines) || i < len(wantLines); i++ {
 		var g, w string
 		if i < len(gotLines) {

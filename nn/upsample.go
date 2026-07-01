@@ -1,34 +1,154 @@
 package nn
 
-import "gonn/tensor"
+import (
+	"fmt"
 
-// Upsample upsamples (N, C, H, W) tensors by an integer ScaleFactor.
-// Mode "nearest" repeats each cell; "bilinear" performs bilinear interpolation.
+	"gonn/tensor"
+)
+
+// Upsample upsamples (N, C, spatial...) tensors by an integer ScaleFactor,
+// matching torch.nn.Upsample for integer scale factors:
+//
+//   - 3D input (N, C, L):        modes "nearest", "linear"
+//   - 4D input (N, C, H, W):     modes "nearest", "bilinear"
+//   - 5D input (N, C, D, H, W):  modes "nearest", "trilinear"
+//
+// AlignCorners (default false, like PyTorch) affects only the linear modes:
+// with align_corners=false source coordinates are (dst+0.5)/scale - 0.5 with
+// edge clamping; with align_corners=true they are dst*(in-1)/(out-1), so the
+// corner samples of input and output coincide. Nearest mode ignores it.
+//
+// Every mode lowers to a constant gather/weight matrix applied with MatMul,
+// so gradients flow by construction and the layer dispatches to cuBLAS
+// automatically on -tags cuda builds.
 type Upsample struct {
 	Base
-	ScaleFactor int
-	Mode        string
+	ScaleFactor  int
+	Mode         string
+	AlignCorners bool
+}
+
+// UpsampleOpt configures an Upsample.
+type UpsampleOpt func(*Upsample)
+
+// WithAlignCorners sets align_corners for the linear interpolation modes
+// ("linear", "bilinear", "trilinear"). Default false (PyTorch parity).
+func WithAlignCorners(on bool) UpsampleOpt {
+	return func(u *Upsample) { u.AlignCorners = on }
 }
 
 // NewUpsample constructs an Upsample. Mode defaults to "nearest" if empty.
-func NewUpsample(scaleFactor int, mode string) *Upsample {
+func NewUpsample(scaleFactor int, mode string, opts ...UpsampleOpt) *Upsample {
 	if scaleFactor <= 0 {
 		panic("Upsample: scaleFactor must be positive")
 	}
 	if mode == "" {
 		mode = "nearest"
 	}
-	if mode != "nearest" && mode != "bilinear" {
-		panic("Upsample: mode must be 'nearest' or 'bilinear'")
+	switch mode {
+	case "nearest", "linear", "bilinear", "trilinear":
+	default:
+		panic("Upsample: mode must be 'nearest', 'linear', 'bilinear' or 'trilinear'")
 	}
-	return &Upsample{ScaleFactor: scaleFactor, Mode: mode}
+	u := &Upsample{ScaleFactor: scaleFactor, Mode: mode}
+	for _, fn := range opts {
+		fn(u)
+	}
+	return u
 }
 
-// Forward upsamples a 4D tensor.
+// NewUpsamplingNearest2d is the torch.nn.UpsamplingNearest2d alias:
+// equivalent to NewUpsample(scale, "nearest") applied to 4D input.
+func NewUpsamplingNearest2d(scale int) *Upsample {
+	return NewUpsample(scale, "nearest")
+}
+
+// NewUpsamplingBilinear2d is the torch.nn.UpsamplingBilinear2d alias:
+// equivalent to NewUpsample(scale, "bilinear", WithAlignCorners(true)) —
+// PyTorch defines this legacy module with align_corners=true.
+func NewUpsamplingBilinear2d(scale int) *Upsample {
+	return NewUpsample(scale, "bilinear", WithAlignCorners(true))
+}
+
+// Forward upsamples a 3D, 4D or 5D tensor according to Mode.
 func (u *Upsample) Forward(x *tensor.Tensor) *tensor.Tensor {
-	if len(x.Shape) != 4 {
-		panic("Upsample: expected 4D input (N,C,H,W)")
+	switch len(x.Shape) {
+	case 3:
+		return u.forward3D(x)
+	case 4:
+		return u.forward4D(x)
+	case 5:
+		return u.forward5D(x)
+	default:
+		panic(fmt.Sprintf("Upsample: expected 3D, 4D or 5D input, got shape %v", x.Shape))
 	}
+}
+
+// srcCoord maps output index o to a (fractional) source coordinate along one
+// axis of length in upsampled to out = in*r.
+func srcCoord(o, in, out, r int, alignCorners bool) float64 {
+	if alignCorners {
+		if out <= 1 {
+			return 0
+		}
+		return float64(o) * float64(in-1) / float64(out-1)
+	}
+	return (float64(o)+0.5)/float64(r) - 0.5
+}
+
+// linWeights returns, for each output index along one axis, the two source
+// indices (clamped) and the weight of the upper one.
+func linWeights(in, out, r int, alignCorners bool) (i0, i1 []int, w []float64) {
+	i0 = make([]int, out)
+	i1 = make([]int, out)
+	w = make([]float64, out)
+	for o := 0; o < out; o++ {
+		s := srcCoord(o, in, out, r, alignCorners)
+		lo := int(floorInt(s))
+		w[o] = s - float64(lo)
+		i0[o] = clampInt(lo, 0, in-1)
+		i1[o] = clampInt(lo+1, 0, in-1)
+	}
+	return i0, i1, w
+}
+
+// applyGather multiplies the flattened spatial dims of x by the transpose of
+// the (outCols, inCols) gather/weight matrix g.
+func applyGather(x *tensor.Tensor, gData []float64, rows, cols int, outShape ...int) *tensor.Tensor {
+	g := tensor.New(gData, rows, cols)
+	NC := x.Shape[0] * x.Shape[1]
+	out := x.Reshape(NC, cols).MatMul(g.Transpose())
+	return out.Reshape(outShape...)
+}
+
+// forward3D upsamples (N, C, L) with mode "nearest" or "linear".
+func (u *Upsample) forward3D(x *tensor.Tensor) *tensor.Tensor {
+	N, C, L := x.Shape[0], x.Shape[1], x.Shape[2]
+	r := u.ScaleFactor
+	outL := L * r
+
+	switch u.Mode {
+	case "nearest":
+		gData := make([]float64, outL*L)
+		for ol := 0; ol < outL; ol++ {
+			gData[ol*L+ol/r] = 1
+		}
+		return applyGather(x, gData, outL, L, N, C, outL)
+
+	case "linear":
+		i0, i1, w := linWeights(L, outL, r, u.AlignCorners)
+		gData := make([]float64, outL*L)
+		for ol := 0; ol < outL; ol++ {
+			gData[ol*L+i0[ol]] += 1 - w[ol]
+			gData[ol*L+i1[ol]] += w[ol]
+		}
+		return applyGather(x, gData, outL, L, N, C, outL)
+	}
+	panic(fmt.Sprintf("Upsample: mode %q not supported for 3D input (want 'nearest' or 'linear')", u.Mode))
+}
+
+// forward4D upsamples (N, C, H, W) with mode "nearest" or "bilinear".
+func (u *Upsample) forward4D(x *tensor.Tensor) *tensor.Tensor {
 	N, C, H, W := x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3]
 	r := u.ScaleFactor
 	outH := H * r
@@ -47,20 +167,18 @@ func (u *Upsample) Forward(x *tensor.Tensor) *tensor.Tensor {
 				gData[(oh*outW+ow)*cols+(ih*W+iw)] = 1
 			}
 		}
-		g := tensor.New(gData, rows, cols)
-		xFlat := x.Reshape(N*C, cols)
-		out := xFlat.MatMul(g.Transpose())
-		return out.Reshape(N, C, outH, outW)
+		return applyGather(x, gData, rows, cols, N, C, outH, outW)
 
 	case "bilinear":
-		// PyTorch-style "align_corners=False" sampling: for each output cell
-		// (oh, ow), source coord is ((oh + 0.5)/scale) - 0.5 (and same for W).
-		// We compute weighted sum over 4 neighbours with clamped indices.
+		// PyTorch-style sampling: with align_corners=false (default), for each
+		// output cell (oh, ow) the source coord is ((oh + 0.5)/scale) - 0.5
+		// (and same for W); with align_corners=true it is oh*(H-1)/(outH-1).
+		// We compute weighted sums over 4 neighbours with clamped indices.
 		rows := outH * outW
 		cols := H * W
 		gData := make([]float64, rows*cols)
 		for oh := 0; oh < outH; oh++ {
-			y := (float64(oh)+0.5)/float64(r) - 0.5
+			y := srcCoord(oh, H, outH, r, u.AlignCorners)
 			y0 := int(floorInt(y))
 			y1 := y0 + 1
 			wy := y - float64(y0)
@@ -68,7 +186,7 @@ func (u *Upsample) Forward(x *tensor.Tensor) *tensor.Tensor {
 			y0c := clampInt(y0, 0, H-1)
 			y1c := clampInt(y1, 0, H-1)
 			for ow := 0; ow < outW; ow++ {
-				x_ := (float64(ow)+0.5)/float64(r) - 0.5
+				x_ := srcCoord(ow, W, outW, r, u.AlignCorners)
 				x0 := int(floorInt(x_))
 				x1 := x0 + 1
 				wx := x_ - float64(x0)
@@ -82,12 +200,63 @@ func (u *Upsample) Forward(x *tensor.Tensor) *tensor.Tensor {
 				gData[row*cols+(y1c*W+x1c)] += wy * wx
 			}
 		}
-		g := tensor.New(gData, rows, cols)
-		xFlat := x.Reshape(N*C, cols)
-		out := xFlat.MatMul(g.Transpose())
-		return out.Reshape(N, C, outH, outW)
+		return applyGather(x, gData, rows, cols, N, C, outH, outW)
 	}
-	panic("Upsample: unsupported mode")
+	panic(fmt.Sprintf("Upsample: mode %q not supported for 4D input (want 'nearest' or 'bilinear')", u.Mode))
+}
+
+// forward5D upsamples (N, C, D, H, W) with mode "nearest" or "trilinear".
+func (u *Upsample) forward5D(x *tensor.Tensor) *tensor.Tensor {
+	N, C, D, H, W := x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3], x.Shape[4]
+	r := u.ScaleFactor
+	outD, outH, outW := D*r, H*r, W*r
+	rows := outD * outH * outW
+	cols := D * H * W
+
+	switch u.Mode {
+	case "nearest":
+		gData := make([]float64, rows*cols)
+		for od := 0; od < outD; od++ {
+			id := od / r
+			for oh := 0; oh < outH; oh++ {
+				ih := oh / r
+				for ow := 0; ow < outW; ow++ {
+					iw := ow / r
+					gData[((od*outH+oh)*outW+ow)*cols+((id*H+ih)*W+iw)] = 1
+				}
+			}
+		}
+		return applyGather(x, gData, rows, cols, N, C, outD, outH, outW)
+
+	case "trilinear":
+		d0, d1, wd := linWeights(D, outD, r, u.AlignCorners)
+		h0, h1, wh := linWeights(H, outH, r, u.AlignCorners)
+		w0, w1, ww := linWeights(W, outW, r, u.AlignCorners)
+		gData := make([]float64, rows*cols)
+		for od := 0; od < outD; od++ {
+			di := [2]int{d0[od], d1[od]}
+			dw := [2]float64{1 - wd[od], wd[od]}
+			for oh := 0; oh < outH; oh++ {
+				hi := [2]int{h0[oh], h1[oh]}
+				hw := [2]float64{1 - wh[oh], wh[oh]}
+				for ow := 0; ow < outW; ow++ {
+					wi := [2]int{w0[ow], w1[ow]}
+					wgt := [2]float64{1 - ww[ow], ww[ow]}
+					row := (od*outH+oh)*outW + ow
+					// 8 corner contributions: product of per-axis weights.
+					for a := 0; a < 2; a++ {
+						for b := 0; b < 2; b++ {
+							for c := 0; c < 2; c++ {
+								gData[row*cols+((di[a]*H+hi[b])*W+wi[c])] += dw[a] * hw[b] * wgt[c]
+							}
+						}
+					}
+				}
+			}
+		}
+		return applyGather(x, gData, rows, cols, N, C, outD, outH, outW)
+	}
+	panic(fmt.Sprintf("Upsample: mode %q not supported for 5D input (want 'nearest' or 'trilinear')", u.Mode))
 }
 
 func floorInt(v float64) float64 {
