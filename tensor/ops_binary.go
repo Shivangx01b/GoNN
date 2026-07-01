@@ -93,38 +93,3 @@ func binOp(a, b *Tensor, op string) *Tensor {
 	return out
 }
 
-// MatMul performs matrix multiplication. Supports 2D x 2D for now.
-// (Batched matmul would handle leading dims with broadcasting.)
-func (t *Tensor) MatMul(o *Tensor) *Tensor {
-	if len(t.Shape) != 2 || len(o.Shape) != 2 {
-		opError("MatMul", "both tensors must be 2D, got %v and %v", t.Shape, o.Shape)
-	}
-	m, k := t.Shape[0], t.Shape[1]
-	k2, n := o.Shape[0], o.Shape[1]
-	if k != k2 {
-		opError("MatMul", "inner dims do not match: %v @ %v", t.Shape, o.Shape)
-	}
-	// Dispatch the heavy GEMM through the active compute backend (CPU by
-	// default; cuBLAS when built with -tags cuda and a CUDA backend is set).
-	out := New(dispatchGemm(t.Data, o.Data, 1, m, k, n, false, false), m, n)
-	finishOp(out, promote(t.Dtype, o.Dtype))
-	if t.RequiresGrad || o.RequiresGrad || t.creator != nil || o.creator != nil {
-		out.RequiresGrad = true
-		out.creator = &Function{
-			Name:   "MatMul",
-			Inputs: []*Tensor{t, o},
-			Backward: func(grad *Tensor, _ []interface{}, inputs []*Tensor) []*Tensor {
-				a, b := inputs[0], inputs[1]
-				// dA = grad @ B^T, dB = A^T @ grad — via GEMM trans flags,
-				// so no explicit transpose copies are materialized.
-				ga := dispatchGemm(grad.Data, b.Data, 1, m, n, k, false, true)
-				gb := dispatchGemm(a.Data, grad.Data, 1, k, m, n, true, false)
-				return []*Tensor{
-					New(ga, a.Shape...),
-					New(gb, b.Shape...),
-				}
-			},
-		}
-	}
-	return out
-}
