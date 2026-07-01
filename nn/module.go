@@ -56,6 +56,10 @@ type Base struct {
 	params   []Param
 	buffers  []Param
 	children []childEntry
+
+	// hooks is nil until the first Register*Hook call, so modules without
+	// hooks pay only a nil check on the Call fast path. See hooks.go.
+	hooks *hookSet
 }
 
 // reg registers a trainable parameter under name and returns it.
@@ -185,10 +189,13 @@ func NewSequential(layers ...Module) *Sequential {
 	return s
 }
 
-// Forward applies each layer in order.
+// Forward applies each layer in order. Each layer runs through the hook
+// pipeline (Call), so per-module and global forward/backward hooks fire for
+// every child. With no hooks registered anywhere this reduces to plain
+// l.Forward(x) calls.
 func (s *Sequential) Forward(x *tensor.Tensor) *tensor.Tensor {
 	for _, l := range s.Layers {
-		x = l.Forward(x)
+		x = Call(l, x)
 	}
 	return x
 }
