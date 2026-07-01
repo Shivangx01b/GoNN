@@ -18,9 +18,11 @@ import (
 
 // slidingSpec describes an N-dimensional sliding-window read pattern over
 // the spatial dims of an (N, C, spatial...) tensor. All slices have length
-// equal to the spatial rank (1-3).
+// equal to the spatial rank (1-3). OutPad (transposed convs only; nil means
+// zero) appends extra output positions at the high edge of each dim.
 type slidingSpec struct {
 	In, Kernel, Stride, Pad, Dilation []int
+	OutPad                            []int
 }
 
 // outSizes returns the output spatial dims for a forward convolution/pool:
@@ -38,11 +40,16 @@ func (s slidingSpec) outSizes() []int {
 }
 
 // transposedOutSizes returns the output spatial dims for a transposed conv:
-// out = (In-1)*Stride - 2*Pad + Dilation*(Kernel-1) + 1.
+// out = (In-1)*Stride - 2*Pad + Dilation*(Kernel-1) + OutPad + 1.
+// The OutPad positions sit at the high edge and have no source taps, so the
+// gather naturally expresses them as all-zero rows.
 func (s slidingSpec) transposedOutSizes() []int {
 	out := make([]int, len(s.In))
 	for d := range s.In {
 		out[d] = (s.In[d]-1)*s.Stride[d] - 2*s.Pad[d] + s.Dilation[d]*(s.Kernel[d]-1) + 1
+		if s.OutPad != nil {
+			out[d] += s.OutPad[d]
+		}
 		if out[d] <= 0 {
 			panic(fmt.Sprintf("nn: non-positive transposed output size %d for dim %d", out[d], d))
 		}
