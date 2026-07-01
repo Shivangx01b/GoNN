@@ -2,89 +2,106 @@ package tensor
 
 import "math"
 
-// Unary elementwise ops with autograd.
+// Elementwise unary math ops. Fixed ops are UnaryOpDefs registered with the
+// registry (registry.go) — one definition drives the fluent method, the
+// name-based (*Tensor).Unary lookup, and GPU dispatch. Parameterized ops
+// (Pow, Clip) build ephemeral defs whose closures capture the parameters.
+// All forward/backward closures are unchanged from the original
+// implementations — numerics are identical.
 
-func unaryOp(t *Tensor, name string, fwd func(float64) float64, bwd func(grad, x, y float64) float64) *Tensor {
-	out := Zeros(t.Shape...)
-	for i, v := range t.Data {
-		out.Data[i] = fwd(v)
-	}
-	finishOp(out, t.Dtype)
-	if t.RequiresGrad || t.creator != nil {
-		out.RequiresGrad = true
-		input := t
-		outData := out.Data
-		out.creator = &Function{
-			Name:   name,
-			Inputs: []*Tensor{t},
-			Backward: func(grad *Tensor, _ []interface{}, _ []*Tensor) []*Tensor {
-				g := Zeros(grad.Shape...)
-				for i := range g.Data {
-					g.Data[i] = bwd(grad.Data[i], input.Data[i], outData[i])
-				}
-				return []*Tensor{g}
-			},
-		}
-	}
-	return out
+var (
+	expDef = UnaryOpDef{Name: "Exp", Kind: UnaryExp,
+		Fwd: math.Exp,
+		Bwd: func(g, x, y float64) float64 { return g * y }}
+
+	logDef = UnaryOpDef{Name: "Log", Kind: UnaryLog,
+		Fwd: math.Log,
+		Bwd: func(g, x, y float64) float64 { return g / x }}
+
+	sqrtDef = UnaryOpDef{Name: "Sqrt", Kind: UnaryNone,
+		Fwd: math.Sqrt,
+		Bwd: func(g, x, y float64) float64 { return g * 0.5 / y }}
+
+	sinDef = UnaryOpDef{Name: "Sin", Kind: UnaryNone,
+		Fwd: math.Sin,
+		Bwd: func(g, x, y float64) float64 { return g * math.Cos(x) }}
+
+	cosDef = UnaryOpDef{Name: "Cos", Kind: UnaryNone,
+		Fwd: math.Cos,
+		Bwd: func(g, x, y float64) float64 { return -g * math.Sin(x) }}
+
+	tanDef = UnaryOpDef{Name: "Tan", Kind: UnaryNone,
+		Fwd: math.Tan,
+		Bwd: func(g, x, y float64) float64 {
+			c := math.Cos(x)
+			return g / (c * c)
+		}}
+
+	absDef = UnaryOpDef{Name: "Abs", Kind: UnaryNone,
+		Fwd: math.Abs,
+		Bwd: func(g, x, y float64) float64 {
+			if x > 0 {
+				return g
+			}
+			if x < 0 {
+				return -g
+			}
+			return 0
+		}}
+
+	reciprocalDef = UnaryOpDef{Name: "Reciprocal", Kind: UnaryNone,
+		Fwd: func(v float64) float64 { return 1 / v },
+		Bwd: func(g, x, y float64) float64 { return -g / (x * x) }}
+
+	squareDef = UnaryOpDef{Name: "Square", Kind: UnaryNone,
+		Fwd: func(v float64) float64 { return v * v },
+		Bwd: func(g, x, y float64) float64 { return g * 2 * x }}
+)
+
+func init() {
+	RegisterUnary(expDef)
+	RegisterUnary(logDef)
+	RegisterUnary(sqrtDef)
+	RegisterUnary(sinDef)
+	RegisterUnary(cosDef)
+	RegisterUnary(tanDef)
+	RegisterUnary(absDef)
+	RegisterUnary(reciprocalDef)
+	RegisterUnary(squareDef)
 }
 
 // Exp returns e^t.
-func (t *Tensor) Exp() *Tensor {
-	return unaryOp(t, "Exp", math.Exp, func(g, x, y float64) float64 { return g * y })
-}
+func (t *Tensor) Exp() *Tensor { return applyUnary(t, expDef) }
 
 // Log returns ln(t).
-func (t *Tensor) Log() *Tensor {
-	return unaryOp(t, "Log", math.Log, func(g, x, y float64) float64 { return g / x })
-}
+func (t *Tensor) Log() *Tensor { return applyUnary(t, logDef) }
 
 // Sqrt returns sqrt(t).
-func (t *Tensor) Sqrt() *Tensor {
-	return unaryOp(t, "Sqrt", math.Sqrt, func(g, x, y float64) float64 { return g * 0.5 / y })
-}
+func (t *Tensor) Sqrt() *Tensor { return applyUnary(t, sqrtDef) }
 
 // Sin returns sin(t).
-func (t *Tensor) Sin() *Tensor {
-	return unaryOp(t, "Sin", math.Sin, func(g, x, y float64) float64 { return g * math.Cos(x) })
-}
+func (t *Tensor) Sin() *Tensor { return applyUnary(t, sinDef) }
 
 // Cos returns cos(t).
-func (t *Tensor) Cos() *Tensor {
-	return unaryOp(t, "Cos", math.Cos, func(g, x, y float64) float64 { return -g * math.Sin(x) })
-}
+func (t *Tensor) Cos() *Tensor { return applyUnary(t, cosDef) }
 
 // Tan returns tan(t).
-func (t *Tensor) Tan() *Tensor {
-	return unaryOp(t, "Tan", math.Tan, func(g, x, y float64) float64 {
-		c := math.Cos(x)
-		return g / (c * c)
-	})
-}
+func (t *Tensor) Tan() *Tensor { return applyUnary(t, tanDef) }
 
 // Abs returns |t|.
-func (t *Tensor) Abs() *Tensor {
-	return unaryOp(t, "Abs", math.Abs, func(g, x, y float64) float64 {
-		if x > 0 {
-			return g
-		}
-		if x < 0 {
-			return -g
-		}
-		return 0
-	})
-}
+func (t *Tensor) Abs() *Tensor { return applyUnary(t, absDef) }
 
 // Reciprocal returns 1/t.
-func (t *Tensor) Reciprocal() *Tensor {
-	return unaryOp(t, "Reciprocal", func(v float64) float64 { return 1 / v },
-		func(g, x, y float64) float64 { return -g / (x * x) })
-}
+func (t *Tensor) Reciprocal() *Tensor { return applyUnary(t, reciprocalDef) }
+
+// Square returns t*t (more efficient than Pow(2)).
+func (t *Tensor) Square() *Tensor { return applyUnary(t, squareDef) }
 
 // Pow returns t^p (scalar exponent).
 func (t *Tensor) Pow(p float64) *Tensor {
-	return unaryOp(t, "Pow", func(v float64) float64 { return math.Pow(v, p) },
-		func(g, x, y float64) float64 {
+	return applyUnary(t, UnaryOpDef{Name: "Pow", Kind: UnaryNone,
+		Fwd: func(v float64) float64 { return math.Pow(v, p) },
+		Bwd: func(g, x, y float64) float64 {
 			if x == 0 {
 				// d/dx x^p at 0 is 0 for p>1, 1 for p==1, and undefined
 				// (+Inf) for p<1. Guard against the Inf; the finite cases
@@ -97,19 +114,13 @@ func (t *Tensor) Pow(p float64) *Tensor {
 				}
 			}
 			return g * p * math.Pow(x, p-1)
-		})
-}
-
-// Square returns t*t (more efficient than Pow(2)).
-func (t *Tensor) Square() *Tensor {
-	return unaryOp(t, "Square", func(v float64) float64 { return v * v },
-		func(g, x, y float64) float64 { return g * 2 * x })
+		}})
 }
 
 // Clip clamps each element to [min, max].
 func (t *Tensor) Clip(minV, maxV float64) *Tensor {
-	return unaryOp(t, "Clip",
-		func(v float64) float64 {
+	return applyUnary(t, UnaryOpDef{Name: "Clip", Kind: UnaryNone,
+		Fwd: func(v float64) float64 {
 			if v < minV {
 				return minV
 			}
@@ -118,11 +129,10 @@ func (t *Tensor) Clip(minV, maxV float64) *Tensor {
 			}
 			return v
 		},
-		func(g, x, y float64) float64 {
+		Bwd: func(g, x, y float64) float64 {
 			if x < minV || x > maxV {
 				return 0
 			}
 			return g
-		},
-	)
+		}})
 }

@@ -23,6 +23,23 @@ import (
 	"gonn/backend"
 )
 
+// UnaryKind aliases backend.UnaryKind (with the constants re-exported below)
+// so registry definitions and custom-op authors never import the backend
+// package directly — this file stays the package's only backend dependency.
+type UnaryKind = backend.UnaryKind
+
+// Re-exported unary kernel kinds (see backend.UnaryKind for the ABI contract).
+const (
+	UnaryNone    = backend.UnaryNone
+	UnaryReLU    = backend.UnaryReLU
+	UnarySigmoid = backend.UnarySigmoid
+	UnaryTanh    = backend.UnaryTanh
+	UnaryExp     = backend.UnaryExp
+	UnaryLog     = backend.UnaryLog
+	UnaryGELU    = backend.UnaryGELU
+	UnarySiLU    = backend.UnarySiLU
+)
+
 // DispatchPolicy controls when elementwise tensor ops are routed to a backend
 // that implements backend.Elementwiser. An op is dispatched when the tensor
 // has at least MinElems elements AND the active backend advertises the
