@@ -1,7 +1,5 @@
 package tensor
 
-import "fmt"
-
 // Reshape returns a tensor with the same data and a new shape.
 // At most one dim may be -1; it is inferred.
 func (t *Tensor) Reshape(shape ...int) *Tensor {
@@ -11,7 +9,7 @@ func (t *Tensor) Reshape(shape ...int) *Tensor {
 	for i, d := range shape {
 		if d == -1 {
 			if negIdx >= 0 {
-				panic("Reshape: only one -1 allowed")
+				opError("Reshape", "only one -1 allowed")
 			}
 			negIdx = i
 		} else {
@@ -21,12 +19,12 @@ func (t *Tensor) Reshape(shape ...int) *Tensor {
 	resolved := append([]int(nil), shape...)
 	if negIdx >= 0 {
 		if len(t.Data)%known != 0 {
-			panic(fmt.Sprintf("Reshape: cannot infer -1, numel=%d known=%d", len(t.Data), known))
+			opError("Reshape", "cannot infer -1, numel=%d known=%d", len(t.Data), known)
 		}
 		resolved[negIdx] = len(t.Data) / known
 	}
 	if numel(resolved) != len(t.Data) {
-		panic(fmt.Sprintf("Reshape: numel mismatch, %d -> %v", len(t.Data), resolved))
+		opError("Reshape", "numel mismatch, %d -> %v", len(t.Data), resolved)
 	}
 	out := &Tensor{Data: t.Data, Shape: resolved, Strides: contiguousStrides(resolved)}
 	if t.RequiresGrad || t.creator != nil {
@@ -50,21 +48,22 @@ func (t *Tensor) View(shape ...int) *Tensor { return t.Reshape(shape...) }
 // Flatten flattens the tensor to 1D.
 func (t *Tensor) Flatten() *Tensor { return t.Reshape(len(t.Data)) }
 
-// Transpose swaps the last two dimensions (matrix transpose).
+// Transpose swaps the last two dimensions of any tensor with rank >= 2
+// (matrix transpose on the trailing dims; leading batch dims untouched).
 func (t *Tensor) Transpose() *Tensor {
 	if len(t.Shape) < 2 {
-		panic("Transpose: need at least 2 dims")
+		opError("Transpose", "need at least 2 dims, got shape %v", t.Shape)
 	}
 	return t.Permute(swapLastTwo(len(t.Shape))...)
 }
 
-// T is shorthand for Transpose (2D only).
+// T is shorthand for Transpose.
 func (t *Tensor) T() *Tensor { return t.Transpose() }
 
 // Permute reorders dimensions according to dims.
 func (t *Tensor) Permute(dims ...int) *Tensor {
 	if len(dims) != len(t.Shape) {
-		panic("Permute: dims length must match tensor rank")
+		opError("Permute", "dims length %d must match tensor rank %d", len(dims), len(t.Shape))
 	}
 	newShape := make([]int, len(dims))
 	for i, d := range dims {
@@ -117,10 +116,7 @@ func (t *Tensor) Squeeze(axis ...int) *Tensor {
 			}
 		}
 	} else {
-		ax := axis[0]
-		if ax < 0 {
-			ax += len(t.Shape)
-		}
+		ax := normalizeAxis("Squeeze", axis[0], len(t.Shape))
 		for i, d := range t.Shape {
 			if i == ax && d == 1 {
 				continue
@@ -134,11 +130,9 @@ func (t *Tensor) Squeeze(axis ...int) *Tensor {
 	return t.Reshape(newShape...)
 }
 
-// Unsqueeze inserts a size-1 dim at axis.
+// Unsqueeze inserts a size-1 dim at axis (axis may be len(t.Shape) to append).
 func (t *Tensor) Unsqueeze(axis int) *Tensor {
-	if axis < 0 {
-		axis += len(t.Shape) + 1
-	}
+	axis = normalizeAxis("Unsqueeze", axis, len(t.Shape)+1)
 	newShape := make([]int, 0, len(t.Shape)+1)
 	newShape = append(newShape, t.Shape[:axis]...)
 	newShape = append(newShape, 1)
@@ -167,11 +161,9 @@ func (t *Tensor) Expand(shape ...int) *Tensor {
 // the slice of the output gradient that it contributed).
 func Concat(axis int, tensors ...*Tensor) *Tensor {
 	if len(tensors) == 0 {
-		panic("Concat: empty input")
+		opError("Concat", "empty input")
 	}
-	if axis < 0 {
-		axis += len(tensors[0].Shape)
-	}
+	axis = normalizeAxis("Concat", axis, len(tensors[0].Shape))
 	totalDim := 0
 	for _, x := range tensors {
 		totalDim += x.Shape[axis]

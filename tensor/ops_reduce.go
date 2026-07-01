@@ -37,7 +37,7 @@ func (t *Tensor) Mean() *Tensor {
 // Max returns the max of all elements as a scalar tensor.
 func (t *Tensor) Max() *Tensor {
 	if len(t.Data) == 0 {
-		panic("Max: empty tensor")
+		opError("Max", "empty tensor")
 	}
 	m := t.Data[0]
 	idx := 0
@@ -67,7 +67,7 @@ func (t *Tensor) Max() *Tensor {
 // Min returns the min of all elements as a scalar tensor.
 func (t *Tensor) Min() *Tensor {
 	if len(t.Data) == 0 {
-		panic("Min: empty tensor")
+		opError("Min", "empty tensor")
 	}
 	m := t.Data[0]
 	idx := 0
@@ -101,9 +101,7 @@ func (t *Tensor) SumAxis(axis int, keepDim bool) *Tensor {
 
 // MeanAxis returns the mean along axis.
 func (t *Tensor) MeanAxis(axis int, keepDim bool) *Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
+	axis = normalizeAxis("MeanAxis", axis, len(t.Shape))
 	n := float64(t.Shape[axis])
 	return sumAxis(t, axis, keepDim).DivScalar(n)
 }
@@ -120,18 +118,11 @@ func (t *Tensor) MinAxis(axis int, keepDim bool) *Tensor {
 
 // ArgMax returns indices of max along axis (no grad).
 func (t *Tensor) ArgMax(axis int) *Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
+	axis = normalizeAxis("ArgMax", axis, len(t.Shape))
 	outShape := append([]int(nil), t.Shape...)
 	outShape = append(outShape[:axis], outShape[axis+1:]...)
 	out := Zeros(outShape...)
-	dim := t.Shape[axis]
-	stride := 1
-	for i := axis + 1; i < len(t.Shape); i++ {
-		stride *= t.Shape[i]
-	}
-	outer := numel(t.Shape) / (dim * stride)
+	dim, stride, outer := axisStrideOuter(t.Shape, axis)
 	outIdx := 0
 	for o := 0; o < outer; o++ {
 		for s := 0; s < stride; s++ {
@@ -153,18 +144,11 @@ func (t *Tensor) ArgMax(axis int) *Tensor {
 
 // ArgMin returns indices of min along axis (no grad).
 func (t *Tensor) ArgMin(axis int) *Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
+	axis = normalizeAxis("ArgMin", axis, len(t.Shape))
 	outShape := append([]int(nil), t.Shape...)
 	outShape = append(outShape[:axis], outShape[axis+1:]...)
 	out := Zeros(outShape...)
-	dim := t.Shape[axis]
-	stride := 1
-	for i := axis + 1; i < len(t.Shape); i++ {
-		stride *= t.Shape[i]
-	}
-	outer := numel(t.Shape) / (dim * stride)
+	dim, stride, outer := axisStrideOuter(t.Shape, axis)
 	outIdx := 0
 	for o := 0; o < outer; o++ {
 		for s := 0; s < stride; s++ {
@@ -186,15 +170,8 @@ func (t *Tensor) ArgMin(axis int) *Tensor {
 
 // sumAxis reduces along one axis.
 func sumAxis(t *Tensor, axis int, keepDim bool) *Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
-	dim := t.Shape[axis]
-	stride := 1
-	for i := axis + 1; i < len(t.Shape); i++ {
-		stride *= t.Shape[i]
-	}
-	outer := numel(t.Shape) / (dim * stride)
+	axis = normalizeAxis("SumAxis", axis, len(t.Shape))
+	dim, stride, outer := axisStrideOuter(t.Shape, axis)
 	outShape := append([]int(nil), t.Shape...)
 	if keepDim {
 		outShape[axis] = 1
@@ -223,12 +200,7 @@ func sumAxis(t *Tensor, axis int, keepDim bool) *Tensor {
 			Backward: func(grad *Tensor, _ []interface{}, _ []*Tensor) []*Tensor {
 				g := Zeros(inShape...)
 				// broadcast grad along reduced axis
-				gDim := inShape[ax]
-				gStride := 1
-				for i := ax + 1; i < len(inShape); i++ {
-					gStride *= inShape[i]
-				}
-				gOuter := numel(inShape) / (gDim * gStride)
+				gDim, gStride, gOuter := axisStrideOuter(inShape, ax)
 				idx := 0
 				for o := 0; o < gOuter; o++ {
 					for s := 0; s < gStride; s++ {
@@ -248,15 +220,8 @@ func sumAxis(t *Tensor, axis int, keepDim bool) *Tensor {
 
 // reduceAxis reduces along one axis with max/min, including correct backward.
 func reduceAxis(t *Tensor, axis int, keepDim bool, op string) *Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
-	dim := t.Shape[axis]
-	stride := 1
-	for i := axis + 1; i < len(t.Shape); i++ {
-		stride *= t.Shape[i]
-	}
-	outer := numel(t.Shape) / (dim * stride)
+	axis = normalizeAxis(op+"Axis", axis, len(t.Shape))
+	dim, stride, outer := axisStrideOuter(t.Shape, axis)
 	outShape := append([]int(nil), t.Shape...)
 	if keepDim {
 		outShape[axis] = 1

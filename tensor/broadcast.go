@@ -1,7 +1,5 @@
 package tensor
 
-import "fmt"
-
 // broadcastShapes returns the broadcasted shape of a and b, NumPy-style.
 func broadcastShapes(a, b []int) []int {
 	n := len(a)
@@ -25,7 +23,7 @@ func broadcastShapes(a, b []int) []int {
 		case db == 1:
 			out[n-1-i] = da
 		default:
-			panic(fmt.Sprintf("broadcast: incompatible shapes %v vs %v", a, b))
+			opError("broadcast", "incompatible shapes %v vs %v", a, b)
 		}
 	}
 	return out
@@ -51,7 +49,7 @@ func expandTo(t *Tensor, target []int) *Tensor {
 	// Validate compatibility.
 	for i := range target {
 		if srcShape[i] != target[i] && srcShape[i] != 1 {
-			panic(fmt.Sprintf("expandTo: cannot broadcast %v to %v", t.Shape, target))
+			opError("expandTo", "cannot broadcast %v to %v", t.Shape, target)
 		}
 	}
 	srcStrides := contiguousStrides(t.Shape)

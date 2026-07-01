@@ -9,8 +9,7 @@ func unaryOp(t *Tensor, name string, fwd func(float64) float64, bwd func(grad, x
 	for i, v := range t.Data {
 		out.Data[i] = fwd(v)
 	}
-	out.Dtype = t.Dtype
-	castInPlace(out)
+	finishOp(out, t.Dtype)
 	if t.RequiresGrad || t.creator != nil {
 		out.RequiresGrad = true
 		input := t

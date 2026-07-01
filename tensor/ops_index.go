@@ -1,34 +1,17 @@
 package tensor
 
-import "fmt"
-
-// axisStrideOuter returns (dim, stride, outer) for iterating a tensor along
-// axis the same way the reduce ops do: data index = o*dim*stride + d*stride + s
-// where o in [0,outer), d in [0,dim), s in [0,stride).
-func axisStrideOuter(shape []int, axis int) (dim, stride, outer int) {
-	dim = shape[axis]
-	stride = 1
-	for i := axis + 1; i < len(shape); i++ {
-		stride *= shape[i]
-	}
-	outer = numel(shape) / (dim * stride)
-	return
-}
-
 // Gather gathers values along axis using integer indices stored as float64 in
 // index. index must have the same rank as t, and the same shape on every axis
 // except (optionally) axis. out[i...] = t[..., index[i...], ...] where the
 // indexed coordinate is along axis. Differentiable wrt t (scatter-add grad).
 func (t *Tensor) Gather(axis int, index *Tensor) *Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
+	axis = normalizeAxis("Gather", axis, len(t.Shape))
 	if len(index.Shape) != len(t.Shape) {
-		panic(fmt.Sprintf("Gather: index rank %d != tensor rank %d", len(index.Shape), len(t.Shape)))
+		opError("Gather", "index rank %d != tensor rank %d", len(index.Shape), len(t.Shape))
 	}
 	for d := range t.Shape {
 		if d != axis && index.Shape[d] != t.Shape[d] {
-			panic(fmt.Sprintf("Gather: index shape %v incompatible with %v on axis %d", index.Shape, t.Shape, d))
+			opError("Gather", "index shape %v incompatible with %v on axis %d", index.Shape, t.Shape, d)
 		}
 	}
 	outShape := append([]int(nil), index.Shape...)
@@ -50,7 +33,7 @@ func (t *Tensor) Gather(axis int, index *Tensor) *Tensor {
 					gi += tDim
 				}
 				if gi < 0 || gi >= tDim {
-					panic(fmt.Sprintf("Gather: index %d out of range [0,%d)", gi, tDim))
+					opError("Gather", "index %d out of range [0,%d)", gi, tDim)
 				}
 				src := o*tDim*tStride + gi*tStride + s
 				out.Data[flat] = t.Data[src]
@@ -81,9 +64,7 @@ func (t *Tensor) Gather(axis int, index *Tensor) *Tensor {
 // (a 1-D tensor of float64-encoded indices). The output has the same shape as t
 // except that axis becomes len(index). Differentiable wrt t (scatter-add grad).
 func (t *Tensor) IndexSelect(axis int, index *Tensor) *Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
+	axis = normalizeAxis("IndexSelect", axis, len(t.Shape))
 	idx := make([]int, len(index.Data))
 	for i, v := range index.Data {
 		j := int(v)
@@ -91,7 +72,7 @@ func (t *Tensor) IndexSelect(axis int, index *Tensor) *Tensor {
 			j += t.Shape[axis]
 		}
 		if j < 0 || j >= t.Shape[axis] {
-			panic(fmt.Sprintf("IndexSelect: index %d out of range [0,%d)", j, t.Shape[axis]))
+			opError("IndexSelect", "index %d out of range [0,%d)", j, t.Shape[axis])
 		}
 		idx[i] = j
 	}

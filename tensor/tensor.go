@@ -4,6 +4,11 @@
 // and strides. Operations build a DAG (Tensor.creator); calling Backward()
 // on a scalar walks the graph in reverse topological order and accumulates
 // gradients into leaf tensors that have RequiresGrad set.
+//
+// Alias policy: some methods have historical aliases kept for compatibility.
+// The canonical names are SiLU (alias Swish), AsType (alias To), Reshape
+// (alias View), Transpose (alias T; swaps the last two dims of any rank >= 2
+// tensor), Unsqueeze, and Repeat (alias Tile).
 package tensor
 
 import (
@@ -24,14 +29,6 @@ type Tensor struct {
 	creator      *Function
 }
 
-// Function records the op that produced a tensor and how to backprop.
-type Function struct {
-	Name    string
-	Inputs  []*Tensor
-	Saved   []interface{}
-	Backward func(grad *Tensor, saved []interface{}, inputs []*Tensor) []*Tensor
-}
-
 // New creates a tensor wrapping data with the given shape.
 func New(data []float64, shape ...int) *Tensor {
 	if len(shape) == 0 {
@@ -39,7 +36,7 @@ func New(data []float64, shape ...int) *Tensor {
 	}
 	n := numel(shape)
 	if len(data) != n {
-		panic(fmt.Sprintf("tensor.New: data length %d does not match shape %v (numel=%d)", len(data), shape, n))
+		opError("New", "data length %d does not match shape %v (numel=%d)", len(data), shape, n)
 	}
 	return &Tensor{Data: data, Shape: append([]int(nil), shape...), Strides: contiguousStrides(shape)}
 }
@@ -91,7 +88,7 @@ func Uniform(low, high float64, shape ...int) *Tensor {
 // Arange returns [start, start+step, ..., stop).
 func Arange(start, stop, step float64) *Tensor {
 	if step == 0 {
-		panic("tensor.Arange: step must be non-zero")
+		opError("Arange", "step must be non-zero")
 	}
 	n := int(math.Ceil((stop - start) / step))
 	if n < 0 {
@@ -146,7 +143,7 @@ func (t *Tensor) Dim() int { return len(t.Shape) }
 // Item returns the scalar value (only valid for tensors with 1 element).
 func (t *Tensor) Item() float64 {
 	if len(t.Data) != 1 {
-		panic("tensor.Item: only valid for single-element tensors")
+		opError("Item", "only valid for single-element tensors, got shape %v", t.Shape)
 	}
 	return t.Data[0]
 }
@@ -178,130 +175,4 @@ func (t *Tensor) ZeroGrad() {
 			t.Grad.Data[i] = 0
 		}
 	}
-}
-
-// Backward computes gradients by walking the autograd DAG in reverse.
-// t must be a scalar (or you must call .Sum() first).
-func (t *Tensor) Backward() {
-	if len(t.Data) != 1 {
-		panic("tensor.Backward: can only call on scalar tensors. Use t.Sum().Backward()")
-	}
-	// Build topological order: parents before children.
-	visited := map[*Tensor]bool{}
-	order := []*Tensor{}
-	var visit func(*Tensor)
-	visit = func(n *Tensor) {
-		if visited[n] || n == nil {
-			return
-		}
-		visited[n] = true
-		if n.creator != nil {
-			for _, p := range n.creator.Inputs {
-				visit(p)
-			}
-		}
-		order = append(order, n)
-	}
-	visit(t)
-
-	// Seed gradient at root.
-	if t.Grad == nil {
-		t.Grad = Ones(t.Shape...)
-	} else {
-		for i := range t.Grad.Data {
-			t.Grad.Data[i] = 1
-		}
-	}
-
-	// Walk in reverse, pushing grads to inputs.
-	for i := len(order) - 1; i >= 0; i-- {
-		n := order[i]
-		if n.creator == nil {
-			continue
-		}
-		grads := n.creator.Backward(n.Grad, n.creator.Saved, n.creator.Inputs)
-		for j, p := range n.creator.Inputs {
-			if !p.RequiresGrad && p.creator == nil {
-				continue
-			}
-			if grads[j] == nil {
-				continue
-			}
-			g := grads[j]
-			// Sum-reduce gradient back to p's shape if broadcasting expanded it.
-			g = unbroadcast(g, p.Shape)
-			if p.Grad == nil {
-				p.Grad = g
-			} else {
-				for k := range p.Grad.Data {
-					p.Grad.Data[k] += g.Data[k]
-				}
-			}
-		}
-	}
-}
-
-// MakeNode attaches a custom autograd node to out: it records inputs and a
-// backward closure that, given out's gradient, returns the gradient for each
-// input (same order as inputs; a nil entry skips that input). This is the
-// escape hatch for custom ops (e.g. a fused CUDA kernel) that compute their
-// own forward/backward outside the built-in op set. If no input requires grad,
-// out is left as a plain leaf.
-func MakeNode(out *Tensor, name string, inputs []*Tensor, backward func(grad *Tensor) []*Tensor) {
-	needsGrad := false
-	for _, in := range inputs {
-		if in != nil && (in.RequiresGrad || in.creator != nil) {
-			needsGrad = true
-			break
-		}
-	}
-	if !needsGrad {
-		return
-	}
-	out.RequiresGrad = true
-	out.creator = &Function{
-		Name:   name,
-		Inputs: inputs,
-		Backward: func(grad *Tensor, _ []interface{}, _ []*Tensor) []*Tensor {
-			return backward(grad)
-		},
-	}
-}
-
-// numel returns the product of dims.
-func numel(shape []int) int {
-	if len(shape) == 0 {
-		return 1
-	}
-	n := 1
-	for _, d := range shape {
-		n *= d
-	}
-	return n
-}
-
-// contiguousStrides returns row-major strides for shape.
-func contiguousStrides(shape []int) []int {
-	if len(shape) == 0 {
-		return []int{}
-	}
-	s := make([]int, len(shape))
-	s[len(shape)-1] = 1
-	for i := len(shape) - 2; i >= 0; i-- {
-		s[i] = s[i+1] * shape[i+1]
-	}
-	return s
-}
-
-// shapesEqual reports whether two shapes are identical.
-func shapesEqual(a, b []int) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

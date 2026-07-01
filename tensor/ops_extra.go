@@ -1,14 +1,12 @@
 package tensor
 
-import "fmt"
-
 // triMask builds a 0/1 mask over the last two dims of shape. keepLower==true
 // keeps entries on/below the k-th diagonal (Tril); otherwise on/above (Triu).
 // An element at (row,col) of the last 2 dims is kept when, for Tril,
 // col <= row+k, and for Triu, col >= row+k.
 func triMask(shape []int, k int, keepLower bool) []float64 {
 	if len(shape) < 2 {
-		panic("Tril/Triu: need at least 2 dims")
+		opError("Tril/Triu", "need at least 2 dims, got shape %v", shape)
 	}
 	rows := shape[len(shape)-2]
 	cols := shape[len(shape)-1]
@@ -73,7 +71,7 @@ func (t *Tensor) Triu(k int) *Tensor {
 // is treated as a constant.
 func Where(cond, a, b *Tensor) *Tensor {
 	if !shapesEqual(a.Shape, b.Shape) || !shapesEqual(cond.Shape, a.Shape) {
-		panic(fmt.Sprintf("Where: shape mismatch cond=%v a=%v b=%v", cond.Shape, a.Shape, b.Shape))
+		opError("Where", "shape mismatch cond=%v a=%v b=%v", cond.Shape, a.Shape, b.Shape)
 	}
 	out := Zeros(a.Shape...)
 	for i := range out.Data {
@@ -110,7 +108,7 @@ func Where(cond, a, b *Tensor) *Tensor {
 // mask must share t's shape. Differentiable wrt t (grad zeroed where filled).
 func (t *Tensor) MaskedFill(mask *Tensor, value float64) *Tensor {
 	if !shapesEqual(mask.Shape, t.Shape) {
-		panic(fmt.Sprintf("MaskedFill: mask shape %v != tensor shape %v", mask.Shape, t.Shape))
+		opError("MaskedFill", "mask shape %v != tensor shape %v", mask.Shape, t.Shape)
 	}
 	out := Zeros(t.Shape...)
 	for i := range out.Data {
@@ -143,9 +141,7 @@ func (t *Tensor) MaskedFill(mask *Tensor, value float64) *Tensor {
 // Cumsum returns the cumulative sum along axis. Differentiable; the backward of
 // a forward cumulative sum is a reverse cumulative sum of the gradient.
 func (t *Tensor) Cumsum(axis int) *Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
+	axis = normalizeAxis("Cumsum", axis, len(t.Shape))
 	dim, stride, outer := axisStrideOuter(t.Shape, axis)
 	out := Zeros(t.Shape...)
 	for o := 0; o < outer; o++ {
@@ -185,10 +181,7 @@ func (t *Tensor) Cumsum(axis int) *Tensor {
 func (t *Tensor) Flip(axes ...int) *Tensor {
 	flip := make([]bool, len(t.Shape))
 	for _, a := range axes {
-		if a < 0 {
-			a += len(t.Shape)
-		}
-		flip[a] = true
+		flip[normalizeAxis("Flip", a, len(t.Shape))] = true
 	}
 	out := flipData(t, flip)
 	if t.RequiresGrad || t.creator != nil {
@@ -235,12 +228,12 @@ func flipData(t *Tensor, flip []bool) *Tensor {
 // sums over the tiled copies). For NumPy-style tiling use Tile.
 func (t *Tensor) Repeat(reps ...int) *Tensor {
 	if len(reps) != len(t.Shape) {
-		panic(fmt.Sprintf("Repeat: reps len %d != tensor rank %d", len(reps), len(t.Shape)))
+		opError("Repeat", "reps len %d != tensor rank %d", len(reps), len(t.Shape))
 	}
 	outShape := make([]int, len(t.Shape))
 	for i := range t.Shape {
 		if reps[i] < 1 {
-			panic("Repeat: reps must be >= 1")
+			opError("Repeat", "reps must be >= 1, got %d", reps[i])
 		}
 		outShape[i] = t.Shape[i] * reps[i]
 	}
@@ -300,11 +293,9 @@ func (t *Tensor) Tile(reps ...int) *Tensor { return t.Repeat(reps...) }
 // be smaller if axis is not divisible by size). Each returned piece is
 // differentiable and routes its gradient back into the corresponding slice of t.
 func (t *Tensor) Split(axis, size int) []*Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
+	axis = normalizeAxis("Split", axis, len(t.Shape))
 	if size < 1 {
-		panic("Split: size must be >= 1")
+		opError("Split", "size must be >= 1, got %d", size)
 	}
 	dim := t.Shape[axis]
 	var sizes []int
@@ -322,11 +313,9 @@ func (t *Tensor) Split(axis, size int) []*Tensor {
 // semantics: the first chunks get ceil(dim/n); the remainder may be smaller or
 // the number of chunks fewer than n). Differentiable, like Split.
 func (t *Tensor) Chunk(axis, n int) []*Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
+	axis = normalizeAxis("Chunk", axis, len(t.Shape))
 	if n < 1 {
-		panic("Chunk: n must be >= 1")
+		opError("Chunk", "n must be >= 1, got %d", n)
 	}
 	dim := t.Shape[axis]
 	size := (dim + n - 1) / n // ceil

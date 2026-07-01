@@ -242,9 +242,7 @@ func (t *Tensor) ReLU6() *Tensor {
 
 // Softmax along axis. Numerically stable (subtracts max).
 func (t *Tensor) Softmax(axis int) *Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
+	axis = normalizeAxis("Softmax", axis, len(t.Shape))
 	mx := t.MaxAxis(axis, true)
 	shifted := t.Sub(mx)
 	exp := shifted.Exp()
@@ -253,9 +251,7 @@ func (t *Tensor) Softmax(axis int) *Tensor {
 
 // LogSoftmax along axis.
 func (t *Tensor) LogSoftmax(axis int) *Tensor {
-	if axis < 0 {
-		axis += len(t.Shape)
-	}
+	axis = normalizeAxis("LogSoftmax", axis, len(t.Shape))
 	mx := t.MaxAxis(axis, true)
 	shifted := t.Sub(mx)
 	logSum := shifted.Exp().SumAxis(axis, true).Log()
@@ -348,7 +344,7 @@ func (t *Tensor) Threshold(thresh, value float64) *Tensor {
 // d/dx = 1 for x > 0; otherwise exp(x/alpha).
 func (t *Tensor) CELU(alpha float64) *Tensor {
 	if alpha == 0 {
-		panic("CELU: alpha must be non-zero")
+		opError("CELU", "alpha must be non-zero")
 	}
 	return unaryOp(t, "CELU",
 		func(v float64) float64 {

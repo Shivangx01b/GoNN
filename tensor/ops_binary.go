@@ -53,8 +53,7 @@ func binOp(a, b *Tensor, op string) *Tensor {
 			out.Data[i] = ax.Data[i] / bx.Data[i]
 		}
 	}
-	out.Dtype = promote(a.Dtype, b.Dtype)
-	castInPlace(out)
+	finishOp(out, promote(a.Dtype, b.Dtype))
 	if a.RequiresGrad || b.RequiresGrad || a.creator != nil || b.creator != nil {
 		out.RequiresGrad = true
 		out.creator = &Function{
@@ -98,18 +97,17 @@ func binOp(a, b *Tensor, op string) *Tensor {
 // (Batched matmul would handle leading dims with broadcasting.)
 func (t *Tensor) MatMul(o *Tensor) *Tensor {
 	if len(t.Shape) != 2 || len(o.Shape) != 2 {
-		panic("MatMul: both tensors must be 2D")
+		opError("MatMul", "both tensors must be 2D, got %v and %v", t.Shape, o.Shape)
 	}
 	m, k := t.Shape[0], t.Shape[1]
 	k2, n := o.Shape[0], o.Shape[1]
 	if k != k2 {
-		panic("MatMul: inner dims do not match")
+		opError("MatMul", "inner dims do not match: %v @ %v", t.Shape, o.Shape)
 	}
 	// Dispatch the heavy GEMM through the active compute backend (CPU by
 	// default; cuBLAS when built with -tags cuda and a CUDA backend is set).
 	out := New(matmul2D(t.Data, o.Data, m, k, n), m, n)
-	out.Dtype = promote(t.Dtype, o.Dtype)
-	castInPlace(out)
+	finishOp(out, promote(t.Dtype, o.Dtype))
 	if t.RequiresGrad || o.RequiresGrad || t.creator != nil || o.creator != nil {
 		out.RequiresGrad = true
 		out.creator = &Function{
