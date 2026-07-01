@@ -19,7 +19,7 @@ func shapeEq(a, b []int) bool {
 }
 
 func TestConv1dShape(t *testing.T) {
-	c := NewConv1d(3, 8, 3, 1, 1, true)
+	c := NewConv1d(3, 8, 3, WithPad(1))
 	x := tensor.Randn(2, 3, 10)
 	y := c.Forward(x)
 	// outL = (10 + 2*1 - 3)/1 + 1 = 10
@@ -29,7 +29,7 @@ func TestConv1dShape(t *testing.T) {
 }
 
 func TestConv1dStride2Shape(t *testing.T) {
-	c := NewConv1d(2, 4, 3, 2, 0, false)
+	c := NewConv1d(2, 4, 3, WithStride(2), WithNoBias())
 	x := tensor.Randn(1, 2, 9)
 	y := c.Forward(x)
 	// outL = (9 - 3)/2 + 1 = 4
@@ -39,7 +39,7 @@ func TestConv1dStride2Shape(t *testing.T) {
 }
 
 func TestConv3dShape(t *testing.T) {
-	c := NewConv3d(2, 4, 3, 1, 1, true)
+	c := NewConv3d(2, 4, 3, WithPad(1))
 	x := tensor.Randn(1, 2, 5, 6, 7)
 	y := c.Forward(x)
 	// outs: (5+2-3)+1=5, (6+2-3)+1=6, (7+2-3)+1=7
@@ -49,7 +49,7 @@ func TestConv3dShape(t *testing.T) {
 }
 
 func TestConvTranspose1dShape(t *testing.T) {
-	c := NewConvTranspose1d(3, 5, 3, 2, 1, true)
+	c := NewConvTranspose1d(3, 5, 3, WithStride(2), WithPad(1))
 	x := tensor.Randn(2, 3, 4)
 	y := c.Forward(x)
 	// outL = (4-1)*2 - 2*1 + 3 = 7
@@ -59,7 +59,7 @@ func TestConvTranspose1dShape(t *testing.T) {
 }
 
 func TestConvTranspose2dShape(t *testing.T) {
-	c := NewConvTranspose2d(2, 4, 3, 2, 1, true)
+	c := NewConvTranspose2d(2, 4, 3, WithStride(2), WithPad(1))
 	x := tensor.Randn(1, 2, 4, 4)
 	y := c.Forward(x)
 	// outH = outW = (4-1)*2 - 2 + 3 = 7
@@ -69,7 +69,7 @@ func TestConvTranspose2dShape(t *testing.T) {
 }
 
 func TestConvTranspose3dShape(t *testing.T) {
-	c := NewConvTranspose3d(2, 3, 3, 2, 1, false)
+	c := NewConvTranspose3d(2, 3, 3, WithStride(2), WithPad(1), WithNoBias())
 	x := tensor.Randn(1, 2, 3, 3, 3)
 	y := c.Forward(x)
 	// each spatial: (3-1)*2 - 2 + 3 = 5
@@ -221,7 +221,7 @@ func TestPixelUnshuffle(t *testing.T) {
 }
 
 func TestInstanceNorm1d(t *testing.T) {
-	in := NewInstanceNorm1d(4, true)
+	in := NewInstanceNorm1d(4, WithAffine(true))
 	x := tensor.Randn(2, 4, 7)
 	y := in.Forward(x)
 	if !shapeEq(y.Shape, []int{2, 4, 7}) {
@@ -230,7 +230,7 @@ func TestInstanceNorm1d(t *testing.T) {
 }
 
 func TestInstanceNorm2d(t *testing.T) {
-	in := NewInstanceNorm2d(3, false)
+	in := NewInstanceNorm2d(3)
 	x := tensor.Randn(2, 3, 5, 6)
 	y := in.Forward(x)
 	if !shapeEq(y.Shape, []int{2, 3, 5, 6}) {

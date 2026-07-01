@@ -93,7 +93,12 @@ func main() {
 	dH2 := cuda.DevAlloc(B * D2)
 	dOut := cuda.DevAlloc(B * D3)
 	defer func() {
-		dW1.Free(); dW2.Free(); dW3.Free(); dH1.Free(); dH2.Free(); dOut.Free()
+		dW1.Free()
+		dW2.Free()
+		dW3.Free()
+		dH1.Free()
+		dH2.Free()
+		dOut.Free()
 	}()
 	resident := func() []float64 {
 		dX := cuda.DevUpload(X) // only the input crosses the bus each call

@@ -6,18 +6,20 @@ import (
 	"gonn/tensor"
 )
 
-// Dropout zeros elements with probability P during training. Identity at eval.
+// Dropout zeros elements with probability P during training. Identity at
+// eval. Train/eval mode comes from the embedded Base and propagates through
+// containers: model.Eval() switches every Dropout in the tree.
 type Dropout struct {
-	P        float64
-	Training bool
+	Base
+	P float64
 }
 
-// NewDropout returns a Dropout module set to training mode.
-func NewDropout(p float64) *Dropout { return &Dropout{P: p, Training: true} }
+// NewDropout returns a Dropout module (training mode by default).
+func NewDropout(p float64) *Dropout { return &Dropout{P: p} }
 
-// Forward applies dropout if Training; otherwise returns x unchanged.
+// Forward applies dropout in training mode; otherwise returns x unchanged.
 func (d *Dropout) Forward(x *tensor.Tensor) *tensor.Tensor {
-	if !d.Training || d.P <= 0 {
+	if !d.Training() || d.P <= 0 {
 		return x
 	}
 	if d.P >= 1 {
@@ -33,9 +35,3 @@ func (d *Dropout) Forward(x *tensor.Tensor) *tensor.Tensor {
 	}
 	return x.Mul(mask)
 }
-
-// Parameters returns nothing (Dropout has no learnable params).
-func (d *Dropout) Parameters() []*tensor.Tensor { return nil }
-
-// SetTraining toggles train/eval mode.
-func (d *Dropout) SetTraining(b bool) { d.Training = b }

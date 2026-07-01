@@ -1,11 +1,14 @@
 package nn
 
 import (
+	"fmt"
+
 	"gonn/tensor"
 )
 
 // Embedding maps integer indices to dense vectors.
 type Embedding struct {
+	Base
 	NumEmbeddings int
 	EmbeddingDim  int
 	Weight        *tensor.Tensor // (NumEmbeddings, EmbeddingDim)
@@ -13,28 +16,24 @@ type Embedding struct {
 
 // NewEmbedding constructs an Embedding with N(0, 1) initialized weights.
 func NewEmbedding(numEmbeddings, embeddingDim int) *Embedding {
-	w := tensor.Randn(numEmbeddings, embeddingDim).SetRequiresGrad(true)
-	return &Embedding{NumEmbeddings: numEmbeddings, EmbeddingDim: embeddingDim, Weight: w}
+	e := &Embedding{NumEmbeddings: numEmbeddings, EmbeddingDim: embeddingDim}
+	e.Weight = e.reg("weight", tensor.Randn(numEmbeddings, embeddingDim).SetRequiresGrad(true))
+	return e
 }
 
-// Forward looks up rows of Weight by integer indices (cast from float64).
-// Implemented as a one-hot @ Weight matmul so gradient scatters to Weight via
-// the existing matmul backward. Indices are not differentiable.
+// Forward looks up rows of Weight by integer indices (cast from float64)
+// via IndexSelect — O(n·dim) with a scatter-add backward, instead of the
+// historical O(n·vocab·dim) one-hot matmul. Indices are not differentiable.
 func (e *Embedding) Forward(indices *tensor.Tensor) *tensor.Tensor {
-	n := len(indices.Data)
-	one := tensor.Zeros(n, e.NumEmbeddings)
-	for i, v := range indices.Data {
-		idx := int(v)
-		if idx < 0 || idx >= e.NumEmbeddings {
-			panic("Embedding: index out of range")
+	// Strict bounds check: IndexSelect wraps negative indices Python-style,
+	// but Embedding has always rejected them.
+	for _, v := range indices.Data {
+		if idx := int(v); idx < 0 || idx >= e.NumEmbeddings {
+			panic(fmt.Sprintf("Embedding: index %d out of range [0,%d)", idx, e.NumEmbeddings))
 		}
-		one.Data[i*e.NumEmbeddings+idx] = 1
 	}
-	out := one.MatMul(e.Weight) // (n, EmbeddingDim)
-	outShape := append([]int(nil), indices.Shape...)
-	outShape = append(outShape, e.EmbeddingDim)
+	flat := indices.Reshape(indices.Numel())
+	out := e.Weight.IndexSelect(0, flat) // (n, EmbeddingDim)
+	outShape := append(append([]int(nil), indices.Shape...), e.EmbeddingDim)
 	return out.Reshape(outShape...)
 }
-
-// Parameters returns the weight matrix.
-func (e *Embedding) Parameters() []*tensor.Tensor { return []*tensor.Tensor{e.Weight} }

@@ -4,7 +4,10 @@ import "gonn/tensor"
 
 // PixelShuffle rearranges a (N, C*r^2, H, W) tensor into (N, C, H*r, W*r),
 // where r is the UpscaleFactor.
-type PixelShuffle struct{ UpscaleFactor int }
+type PixelShuffle struct {
+	Base
+	UpscaleFactor int
+}
 
 // NewPixelShuffle constructs a PixelShuffle with the given upscale factor.
 func NewPixelShuffle(r int) *PixelShuffle {
@@ -33,11 +36,11 @@ func (p *PixelShuffle) Forward(x *tensor.Tensor) *tensor.Tensor {
 	return y.Reshape(N, Cout, H*r, W*r)
 }
 
-// Parameters returns nothing.
-func (p *PixelShuffle) Parameters() []*tensor.Tensor { return nil }
-
 // PixelUnshuffle is the inverse: (N, C, H*r, W*r) -> (N, C*r^2, H, W).
-type PixelUnshuffle struct{ DownscaleFactor int }
+type PixelUnshuffle struct {
+	Base
+	DownscaleFactor int
+}
 
 // NewPixelUnshuffle constructs a PixelUnshuffle.
 func NewPixelUnshuffle(r int) *PixelUnshuffle {
@@ -66,6 +69,3 @@ func (p *PixelUnshuffle) Forward(x *tensor.Tensor) *tensor.Tensor {
 	// -> (N, C*r*r, H, W)
 	return y.Reshape(N, C*r*r, H, W)
 }
-
-// Parameters returns nothing.
-func (p *PixelUnshuffle) Parameters() []*tensor.Tensor { return nil }

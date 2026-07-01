@@ -52,8 +52,8 @@ func TestCPUGemm(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 
 	cases := []struct {
-		batch, m, k, n   int
-		transA, transB   bool
+		batch, m, k, n int
+		transA, transB bool
 	}{
 		{1, 3, 4, 5, false, false}, // plain 2D
 		{1, 3, 4, 5, true, false},

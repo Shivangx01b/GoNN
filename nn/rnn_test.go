@@ -60,7 +60,11 @@ func TestRNNCellBackpropPopulatesGrads(t *testing.T) {
 
 func TestMultiLayerRNNShape(t *testing.T) {
 	for _, bidir := range []bool{false, true} {
-		m := NewMultiLayerRNN(4, 6, 2, bidir)
+		opts := []RNNOpt{WithLayers(2)}
+		if bidir {
+			opts = append(opts, WithBidirectional())
+		}
+		m := NewRNN(4, 6, opts...)
 		x := tensor.Randn(3, 5, 4)
 		y := m.Forward(x)
 		wantH := 6
@@ -75,7 +79,11 @@ func TestMultiLayerRNNShape(t *testing.T) {
 
 func TestMultiLayerLSTMShape(t *testing.T) {
 	for _, bidir := range []bool{false, true} {
-		m := NewMultiLayerLSTM(4, 6, 2, bidir)
+		opts := []RNNOpt{WithLayers(2)}
+		if bidir {
+			opts = append(opts, WithBidirectional())
+		}
+		m := NewLSTM(4, 6, opts...)
 		x := tensor.Randn(3, 5, 4)
 		y := m.Forward(x)
 		wantH := 6
@@ -90,7 +98,11 @@ func TestMultiLayerLSTMShape(t *testing.T) {
 
 func TestMultiLayerGRUShape(t *testing.T) {
 	for _, bidir := range []bool{false, true} {
-		m := NewMultiLayerGRU(4, 6, 2, bidir)
+		opts := []RNNOpt{WithLayers(2)}
+		if bidir {
+			opts = append(opts, WithBidirectional())
+		}
+		m := NewGRU(4, 6, opts...)
 		x := tensor.Randn(3, 5, 4)
 		y := m.Forward(x)
 		wantH := 6
@@ -104,7 +116,7 @@ func TestMultiLayerGRUShape(t *testing.T) {
 }
 
 func TestMultiLayerLSTMBackpropPopulatesGrads(t *testing.T) {
-	m := NewMultiLayerLSTM(3, 4, 2, true)
+	m := NewLSTM(3, 4, WithLayers(2), WithBidirectional())
 	x := tensor.Randn(2, 3, 3)
 	y := m.Forward(x)
 	loss := y.Sum()

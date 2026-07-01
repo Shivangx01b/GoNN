@@ -15,10 +15,10 @@ func main() {
 	rand.Seed(3)
 
 	X, Y := makeImgs(120, 3) // 3 classes
-	conv1 := nn.NewConv2d(1, 8, 3, 1, 1, true)
-	pool1 := &nn.MaxPool2d{KH: 2, KW: 2, StrideH: 2, StrideW: 2}
-	conv2 := nn.NewConv2d(8, 16, 3, 1, 1, true)
-	gap := &nn.AdaptiveAvgPool2d{OutH: 1, OutW: 1}
+	conv1 := nn.NewConv2d(1, 8, 3, nn.WithPad(1))
+	pool1 := nn.NewMaxPool2d(2)
+	conv2 := nn.NewConv2d(8, 16, 3, nn.WithPad(1))
+	gap := nn.NewAdaptiveAvgPool2d(1, 1)
 	head := nn.NewLinear(16, 3, true)
 
 	params := []*tensor.Tensor{}
@@ -32,9 +32,9 @@ func main() {
 		x := conv1.Forward(X).ReLU()
 		x = pool1.Forward(x)
 		x = conv2.Forward(x).ReLU()
-		x = gap.Forward(x)         // (N, 16, 1, 1)
+		x = gap.Forward(x) // (N, 16, 1, 1)
 		x = x.Reshape(x.Shape[0], 16)
-		logits := head.Forward(x)  // (N, 3)
+		logits := head.Forward(x) // (N, 3)
 		loss := nn.CrossEntropyLoss(logits, Y)
 		loss.Backward()
 		opt.Step()

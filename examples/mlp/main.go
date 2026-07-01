@@ -18,9 +18,9 @@ func main() {
 	X, Y := makeBlobs(300, 3, 2)
 	model := nn.NewSequential(
 		nn.NewLinear(2, 32, true),
-		nn.ReLU{},
+		nn.ReLU(),
 		nn.NewLinear(32, 16, true),
-		nn.ReLU{},
+		nn.ReLU(),
 		nn.NewLinear(16, 3, true),
 	)
 	opt := optim.NewAdam(model.Parameters(), 0.01)

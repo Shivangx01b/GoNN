@@ -100,6 +100,10 @@ func init() {
 	current.Store(&holder{cpuBackend{}})
 }
 
+// NewCPU returns the pure-Go CPU backend (the default). Useful for tests and
+// benchmarks that need to compare an accelerator against the reference path.
+func NewCPU() Backend { return cpuBackend{} }
+
 // Use switches the active backend and returns the previous one so callers can
 // restore it on defer. Safe for concurrent use.
 func Use(b Backend) Backend {

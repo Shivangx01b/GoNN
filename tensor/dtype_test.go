@@ -16,8 +16,8 @@ func TestFloat16KnownValues(t *testing.T) {
 		{1, 1},
 		{-2, -2},
 		{0.5, 0.5},
-		{65504, 65504},          // max normal half
-		{0.1, 0.0999755859375},  // nearest half to 0.1
+		{65504, 65504},                       // max normal half
+		{0.1, 0.0999755859375},               // nearest half to 0.1
 		{math.Pow(2, -24), math.Pow(2, -24)}, // smallest positive subnormal
 	}
 	for _, c := range cases {

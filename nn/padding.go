@@ -2,40 +2,26 @@ package nn
 
 import "gonn/tensor"
 
-// buildPad2dGather returns a (H*W, outH*outW) matrix that places each input
-// spatial cell into the output at position determined by indexMap[outIdx],
-// where indexMap[k] >= 0 is the input flat index to read, or < 0 means zero.
-//
-// Returning a (outH*outW, H*W) gather lets us compute out = x @ G^T, similar
-// to im2col. Caller provides indexMap of length outH*outW.
-func buildPad2dGather(H, W, outH, outW int, indexMap []int) *tensor.Tensor {
-	rows := outH * outW
-	cols := H * W
-	gData := make([]float64, rows*cols)
-	for r := 0; r < rows; r++ {
-		src := indexMap[r]
-		if src >= 0 && src < cols {
-			gData[r*cols+src] = 1
-		}
-	}
-	return tensor.New(gData, rows, cols)
-}
+// 2D padding layers, all built on indexMapGather (gather.go): each output
+// cell reads at most one input cell (or zero), so a single 0/1 gather matrix
+// expresses zero/reflection/replication padding.
 
 // applyPad2d applies a 2D padding selector to an (N, C, H, W) input.
 // indexMap describes where each output cell reads from in input flat indices,
-// or -1 for "zero fill". An optional fillTensor (shape (N,C,outH,outW)) is
-// added after the gather (used by Constant/Reflection/Replication to inject
-// non-zero borders that depend on input via separate selector).
+// or -1 for "zero fill".
 func applyPad2d(x *tensor.Tensor, outH, outW int, indexMap []int) *tensor.Tensor {
 	N, C, H, W := x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3]
-	g := buildPad2dGather(H, W, outH, outW, indexMap)
+	g := indexMapGather(indexMap, H*W)
 	xFlat := x.Reshape(N*C, H*W)
 	out := xFlat.MatMul(g.Transpose()) // (N*C, outH*outW)
 	return out.Reshape(N, C, outH, outW)
 }
 
 // ZeroPad2d pads (N, C, H, W) with zeros on the four sides.
-type ZeroPad2d struct{ Top, Bottom, Left, Right int }
+type ZeroPad2d struct {
+	Base
+	Top, Bottom, Left, Right int
+}
 
 // NewZeroPad2d constructs a ZeroPad2d.
 func NewZeroPad2d(top, bottom, left, right int) *ZeroPad2d {
@@ -70,11 +56,9 @@ func (p *ZeroPad2d) Forward(x *tensor.Tensor) *tensor.Tensor {
 	return applyPad2d(x, outH, outW, indexMap)
 }
 
-// Parameters returns nothing.
-func (p *ZeroPad2d) Parameters() []*tensor.Tensor { return nil }
-
 // ConstantPad2d pads with a fixed scalar Value.
 type ConstantPad2d struct {
+	Base
 	Top, Bottom, Left, Right int
 	Value                    float64
 }
@@ -89,11 +73,11 @@ func (p *ConstantPad2d) Forward(x *tensor.Tensor) *tensor.Tensor {
 	if len(x.Shape) != 4 {
 		panic("ConstantPad2d: expected 4D input")
 	}
-	N, C, H, W := x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3]
+	H, W := x.Shape[2], x.Shape[3]
 	outH := H + p.Top + p.Bottom
 	outW := W + p.Left + p.Right
 	indexMap := make([]int, outH*outW)
-	// fillMask[r] = 1 means this is a border cell to be set to Value.
+	// fillMask[r] = Value on border cells.
 	fillMask := make([]float64, outH*outW)
 	for i := range indexMap {
 		indexMap[i] = -1
@@ -112,13 +96,8 @@ func (p *ConstantPad2d) Forward(x *tensor.Tensor) *tensor.Tensor {
 	gathered := applyPad2d(x, outH, outW, indexMap) // (N, C, outH, outW)
 	// Add border value tensor (broadcast over N, C).
 	fill := tensor.New(fillMask, 1, 1, outH, outW)
-	_ = N
-	_ = C
 	return gathered.Add(fill)
 }
-
-// Parameters returns nothing.
-func (p *ConstantPad2d) Parameters() []*tensor.Tensor { return nil }
 
 // reflectIndex maps a (possibly out-of-range) coordinate to the reflected
 // index within [0, size). The classic "no edge repeat" reflection used by
@@ -151,7 +130,10 @@ func replicateIndex(i, size int) int {
 }
 
 // ReflectionPad2d reflects the input across its borders.
-type ReflectionPad2d struct{ Top, Bottom, Left, Right int }
+type ReflectionPad2d struct {
+	Base
+	Top, Bottom, Left, Right int
+}
 
 // NewReflectionPad2d constructs a ReflectionPad2d.
 func NewReflectionPad2d(top, bottom, left, right int) *ReflectionPad2d {
@@ -177,11 +159,11 @@ func (p *ReflectionPad2d) Forward(x *tensor.Tensor) *tensor.Tensor {
 	return applyPad2d(x, outH, outW, indexMap)
 }
 
-// Parameters returns nothing.
-func (p *ReflectionPad2d) Parameters() []*tensor.Tensor { return nil }
-
 // ReplicationPad2d replicates the edge values.
-type ReplicationPad2d struct{ Top, Bottom, Left, Right int }
+type ReplicationPad2d struct {
+	Base
+	Top, Bottom, Left, Right int
+}
 
 // NewReplicationPad2d constructs a ReplicationPad2d.
 func NewReplicationPad2d(top, bottom, left, right int) *ReplicationPad2d {
@@ -206,6 +188,3 @@ func (p *ReplicationPad2d) Forward(x *tensor.Tensor) *tensor.Tensor {
 	}
 	return applyPad2d(x, outH, outW, indexMap)
 }
-
-// Parameters returns nothing.
-func (p *ReplicationPad2d) Parameters() []*tensor.Tensor { return nil }

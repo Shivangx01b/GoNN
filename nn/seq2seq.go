@@ -7,8 +7,8 @@ import (
 // Seq2Seq is a minimal encoder-decoder model:
 //
 //   - EmbSrc embeds source token indices,
-//   - Encoder is a single-layer LSTM that consumes the source sequence; its
-//     final (h, c) state initializes the decoder's state,
+//   - Encoder is a single-layer LSTM cell that consumes the source sequence;
+//     its final (h, c) state initializes the decoder's state,
 //   - EmbTgt embeds target token indices,
 //   - Decoder is an LSTMCell stepped over the target sequence in teacher-forced
 //     fashion,
@@ -18,7 +18,10 @@ import (
 // sampling. v1 returns logits over the whole target sequence in one shot for
 // teacher-forced training; for inference, call the encoder once and step the
 // decoder cell yourself.
+//
+// Seq2Seq takes two inputs, so it satisfies Child but not Module.
 type Seq2Seq struct {
+	Base
 	EmbSrc     *Embedding
 	EmbTgt     *Embedding
 	Encoder    *LSTMCell // single-layer encoder, run inside Forward
@@ -30,7 +33,7 @@ type Seq2Seq struct {
 // NewSeq2Seq constructs a Seq2Seq model with single-layer LSTM encoder and
 // decoder. embedDim is used for both source and target embeddings.
 func NewSeq2Seq(srcVocab, tgtVocab, embedDim, hidden int) *Seq2Seq {
-	return &Seq2Seq{
+	m := &Seq2Seq{
 		EmbSrc:     NewEmbedding(srcVocab, embedDim),
 		EmbTgt:     NewEmbedding(tgtVocab, embedDim),
 		Encoder:    NewLSTMCell(embedDim, hidden),
@@ -38,6 +41,12 @@ func NewSeq2Seq(srcVocab, tgtVocab, embedDim, hidden int) *Seq2Seq {
 		OutProj:    NewLinear(hidden, tgtVocab, true),
 		HiddenSize: hidden,
 	}
+	m.regChild("embsrc", m.EmbSrc)
+	m.regChild("embtgt", m.EmbTgt)
+	m.regChild("encoder", m.Encoder)
+	m.regChild("decoder", m.Decoder)
+	m.regChild("outproj", m.OutProj)
+	return m
 }
 
 // Forward runs the full teacher-forced pass.
@@ -61,35 +70,19 @@ func (m *Seq2Seq) Forward(srcIdx, tgtIdx *tensor.Tensor) *tensor.Tensor {
 	srcEmb := m.EmbSrc.Forward(srcIdx) // (B, T_src, E)
 	var encState *LSTMState
 	for t := 0; t < Tsrc; t++ {
-		xt := sliceTime(srcEmb, t) // (B, E)
-		encState = m.Encoder.Forward(xt, encState)
+		encState = m.Encoder.Forward(sliceTime(srcEmb, t), encState)
 	}
-	// Initial decoder state = encoder final state.
 	decState := encState
 
 	// --- Decode (teacher-forced) ---
 	tgtEmb := m.EmbTgt.Forward(tgtIdx) // (B, T_tgt, E)
-	H := m.HiddenSize
 	outs := make([]*tensor.Tensor, Ttgt)
 	for t := 0; t < Ttgt; t++ {
-		xt := sliceTime(tgtEmb, t)
-		decState = m.Decoder.Forward(xt, decState)
+		decState = m.Decoder.Forward(sliceTime(tgtEmb, t), decState)
 		outs[t] = decState.H
 	}
-	hidden := stackTime(outs, B, Ttgt, H) // (B, T_tgt, H)
+	hidden := stackTime(outs, B, Ttgt, m.HiddenSize) // (B, T_tgt, H)
 
 	// --- Project to logits ---
-	logits := m.OutProj.Forward(hidden) // (B, T_tgt, tgtVocab)
-	return logits
-}
-
-// Parameters returns all trainable parameters in the model.
-func (m *Seq2Seq) Parameters() []*tensor.Tensor {
-	var ps []*tensor.Tensor
-	ps = append(ps, m.EmbSrc.Parameters()...)
-	ps = append(ps, m.EmbTgt.Parameters()...)
-	ps = append(ps, m.Encoder.Parameters()...)
-	ps = append(ps, m.Decoder.Parameters()...)
-	ps = append(ps, m.OutProj.Parameters()...)
-	return ps
+	return m.OutProj.Forward(hidden) // (B, T_tgt, tgtVocab)
 }

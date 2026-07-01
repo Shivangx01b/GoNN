@@ -70,67 +70,67 @@ func TestModuleParity(t *testing.T) {
 		}},
 		{"Conv1d(2,3,k3,s2,p1)", func() string {
 			rand.Seed(103)
-			m := NewConv1d(2, 3, 3, 2, 1, true)
+			m := NewConv1d(2, 3, 3, WithStride(2), WithPad(1))
 			return sig(m, m.Forward(tensor.Randn(2, 2, 7)))
 		}},
 		{"Conv2d(2,3,k3,s2,p1)", func() string {
 			rand.Seed(104)
-			m := NewConv2d(2, 3, 3, 2, 1, true)
+			m := NewConv2d(2, 3, 3, WithStride(2), WithPad(1))
 			return sig(m, m.Forward(tensor.Randn(2, 2, 6, 7)))
 		}},
 		{"Conv2dHW(2,3,k32,s21,p10)", func() string {
 			rand.Seed(105)
-			m := NewConv2dHW(2, 3, 3, 2, 2, 1, 1, 0, true)
+			m := NewConv2d(2, 3, 3, WithKernel(3, 2), WithStride(2, 1), WithPad(1, 0))
 			return sig(m, m.Forward(tensor.Randn(2, 2, 6, 7)))
 		}},
 		{"Conv3d(2,2,k2,s1,p0)", func() string {
 			rand.Seed(106)
-			m := NewConv3d(2, 2, 2, 1, 0, true)
+			m := NewConv3d(2, 2, 2)
 			return sig(m, m.Forward(tensor.Randn(2, 2, 3, 4, 4)))
 		}},
 		{"ConvTranspose1d(2,3,k3,s2,p1)", func() string {
 			rand.Seed(107)
-			m := NewConvTranspose1d(2, 3, 3, 2, 1, true)
+			m := NewConvTranspose1d(2, 3, 3, WithStride(2), WithPad(1))
 			return sig(m, m.Forward(tensor.Randn(2, 2, 5)))
 		}},
 		{"ConvTranspose2d(2,3,k3,s2,p1)", func() string {
 			rand.Seed(108)
-			m := NewConvTranspose2d(2, 3, 3, 2, 1, true)
+			m := NewConvTranspose2d(2, 3, 3, WithStride(2), WithPad(1))
 			return sig(m, m.Forward(tensor.Randn(2, 2, 4, 4)))
 		}},
 		{"ConvTranspose3d(2,2,k2,s2,p0)", func() string {
 			rand.Seed(109)
-			m := NewConvTranspose3d(2, 2, 2, 2, 0, true)
+			m := NewConvTranspose3d(2, 2, 2, WithStride(2))
 			return sig(m, m.Forward(tensor.Randn(1, 2, 3, 3, 3)))
 		}},
 		{"MaxPool1d(2,2)", func() string {
 			rand.Seed(110)
-			m := NewMaxPool1d(2, 2)
+			m := NewMaxPool1d(2)
 			return sig(m, m.Forward(tensor.Randn(2, 2, 6)))
 		}},
 		{"AvgPool1d(2,2)", func() string {
 			rand.Seed(111)
-			m := NewAvgPool1d(2, 2)
+			m := NewAvgPool1d(2)
 			return sig(m, m.Forward(tensor.Randn(2, 2, 6)))
 		}},
 		{"MaxPool2d(2,2)", func() string {
 			rand.Seed(112)
-			m := NewMaxPool2d(2, 2)
+			m := NewMaxPool2d(2)
 			return sig(m, m.Forward(tensor.Randn(2, 2, 4, 4)))
 		}},
 		{"AvgPool2d(2,2)", func() string {
 			rand.Seed(113)
-			m := NewAvgPool2d(2, 2)
+			m := NewAvgPool2d(2)
 			return sig(m, m.Forward(tensor.Randn(2, 2, 4, 4)))
 		}},
 		{"MaxPool3d(2,2)", func() string {
 			rand.Seed(114)
-			m := NewMaxPool3d(2, 2)
+			m := NewMaxPool3d(2)
 			return sig(m, m.Forward(tensor.Randn(1, 2, 4, 4, 4)))
 		}},
 		{"AvgPool3d(2,2)", func() string {
 			rand.Seed(115)
-			m := NewAvgPool3d(2, 2)
+			m := NewAvgPool3d(2)
 			return sig(m, m.Forward(tensor.Randn(1, 2, 4, 4, 4)))
 		}},
 		{"AdaptiveAvgPool1d(3)", func() string {
@@ -188,12 +188,12 @@ func TestModuleParity(t *testing.T) {
 		}},
 		{"InstanceNorm1d(2,affine)", func() string {
 			rand.Seed(126)
-			m := NewInstanceNorm1d(2, true)
+			m := NewInstanceNorm1d(2, WithAffine(true))
 			return sig(m, m.Forward(tensor.Randn(2, 2, 6)))
 		}},
 		{"InstanceNorm2d(2,noaffine)", func() string {
 			rand.Seed(127)
-			m := NewInstanceNorm2d(2, false)
+			m := NewInstanceNorm2d(2)
 			return sig(m, m.Forward(tensor.Randn(2, 2, 4, 4)))
 		}},
 		{"Embedding(5,3)", func() string {
@@ -208,7 +208,7 @@ func TestModuleParity(t *testing.T) {
 		}},
 		{"GLU(dim=-1)", func() string {
 			rand.Seed(130)
-			m := GLU{Dim: -1}
+			m := NewGLU(-1)
 			return sig(m, m.Forward(tensor.Randn(3, 8)))
 		}},
 		{"Bilinear(3,4,2,bias)", func() string {
@@ -293,17 +293,17 @@ func TestModuleParity(t *testing.T) {
 		}},
 		{"MultiLayerRNN(3,4,2,bidir)", func() string {
 			rand.Seed(147)
-			m := NewMultiLayerRNN(3, 4, 2, true)
+			m := NewRNN(3, 4, WithLayers(2), WithBidirectional())
 			return sig(m, m.Forward(tensor.Randn(2, 3, 3)))
 		}},
 		{"MultiLayerLSTM(3,4,2)", func() string {
 			rand.Seed(148)
-			m := NewMultiLayerLSTM(3, 4, 2, false)
+			m := NewLSTM(3, 4, WithLayers(2))
 			return sig(m, m.Forward(tensor.Randn(2, 3, 3)))
 		}},
 		{"MultiLayerGRU(3,4,2,bidir)", func() string {
 			rand.Seed(149)
-			m := NewMultiLayerGRU(3, 4, 2, true)
+			m := NewGRU(3, 4, WithLayers(2), WithBidirectional())
 			return sig(m, m.Forward(tensor.Randn(2, 3, 3)))
 		}},
 		{"MultiHeadAttention(8,2)-causal", func() string {
@@ -336,22 +336,22 @@ func TestModuleParity(t *testing.T) {
 		}},
 		{"Sequential(Lin-ReLU-Lin)", func() string {
 			rand.Seed(155)
-			m := NewSequential(NewLinear(4, 8, true), ReLU{}, NewLinear(8, 2, true))
+			m := NewSequential(NewLinear(4, 8, true), ReLU(), NewLinear(8, 2, true))
 			return sig(m, m.Forward(tensor.Randn(3, 4)))
 		}},
 		{"Softmax(axis1)", func() string {
 			rand.Seed(156)
-			m := Softmax{Axis: 1}
+			m := NewSoftmax(1)
 			return paramSig(nil) + " | " + fwdSig(m.Forward(tensor.Randn(3, 5)))
 		}},
 		{"GELU-module", func() string {
 			rand.Seed(157)
-			m := GELU{}
+			m := GELU()
 			return paramSig(nil) + " | " + fwdSig(m.Forward(tensor.Randn(3, 5)))
 		}},
 		{"SiLU-module", func() string {
 			rand.Seed(158)
-			m := SiLU{}
+			m := SiLU()
 			return paramSig(nil) + " | " + fwdSig(m.Forward(tensor.Randn(3, 5)))
 		}},
 	}

@@ -140,7 +140,7 @@ func TestCosineEmbeddingLoss(t *testing.T) {
 
 func TestTripletMarginLoss(t *testing.T) {
 	a := tensor.New([]float64{0, 0, 0, 0}, 2, 2).SetRequiresGrad(true)
-	p := tensor.New([]float64{1, 1, 1, 1}, 2, 2) // far from anchor
+	p := tensor.New([]float64{1, 1, 1, 1}, 2, 2)         // far from anchor
 	n := tensor.New([]float64{0.1, 0.1, 0.1, 0.1}, 2, 2) // close to anchor
 	loss := TripletMarginLoss(a, p, n, 1.0)
 	if v := assertScalar(t, loss); v <= 0 {
@@ -188,7 +188,7 @@ func TestGLUForwardAndGrad(t *testing.T) {
 	// Input shape (1, 4): a = [1, 2], b = [0, 0].
 	// sigmoid(0) = 0.5, so output = [0.5, 1.0].
 	x := tensor.New([]float64{1, 2, 0, 0}, 1, 4).SetRequiresGrad(true)
-	g := GLU{Dim: 1}
+	g := NewGLU(1)
 	y := g.Forward(x)
 	if y.Shape[0] != 1 || y.Shape[1] != 2 {
 		t.Fatalf("GLU shape: got %v want [1 2]", y.Shape)
@@ -216,19 +216,19 @@ func TestNewActivationModules(t *testing.T) {
 	x := tensor.New([]float64{-1, 0, 1}, 3)
 	// Just confirm forward runs and produces correct shape for each new wrapper.
 	mods := []Module{
-		LogSigmoid{},
-		Hardshrink{Lambda: 0.5},
-		Softshrink{Lambda: 0.5},
-		Tanhshrink{},
-		Threshold{Thresh: 0, Value: -1},
-		CELU{Alpha: 1.0},
-		Mish{},
-		HardSwish{},
-		Softplus{},
-		Softsign{},
-		HardSigmoid{},
-		SELU{},
-		ReLU6{},
+		LogSigmoid(),
+		Hardshrink(0.5),
+		Softshrink(0.5),
+		Tanhshrink(),
+		Threshold(0, -1),
+		CELU(1.0),
+		Mish(),
+		HardSwish(),
+		Softplus(),
+		Softsign(),
+		HardSigmoid(),
+		SELU(),
+		ReLU6(),
 	}
 	for _, m := range mods {
 		y := m.Forward(x)

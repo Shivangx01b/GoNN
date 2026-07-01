@@ -38,10 +38,10 @@ func main() {
 	// enough to escape it.
 	for step := 0; step < 400; step++ {
 		X, Y := makeBatch(32)
-		emb := embedding.Forward(X)        // (B, seq, embDim)
-		enc := encoder.Forward(emb)        // (B, seq, embDim)
-		pooled := enc.MeanAxis(1, false)   // (B, embDim)
-		logits := head.Forward(pooled)     // (B, classes)
+		emb := embedding.Forward(X)      // (B, seq, embDim)
+		enc := encoder.Forward(emb)      // (B, seq, embDim)
+		pooled := enc.MeanAxis(1, false) // (B, embDim)
+		logits := head.Forward(pooled)   // (B, classes)
 		loss := nn.CrossEntropyLoss(logits, Y)
 
 		opt.ZeroGrad()

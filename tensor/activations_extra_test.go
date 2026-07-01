@@ -9,8 +9,8 @@ func TestLogSigmoidForward(t *testing.T) {
 	x := New([]float64{-1, 0, 1, 2}, 4)
 	y := x.LogSigmoid()
 	want := []float64{
-		-math.Log(1 + math.Exp(1)),  // log(sigmoid(-1)) = -log(1+e)
-		-math.Log(2),                // log(0.5) = -log(2)
+		-math.Log(1 + math.Exp(1)), // log(sigmoid(-1)) = -log(1+e)
+		-math.Log(2),               // log(0.5) = -log(2)
 		-math.Log(1 + math.Exp(-1)),
 		-math.Log(1 + math.Exp(-2)),
 	}

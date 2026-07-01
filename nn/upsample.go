@@ -5,6 +5,7 @@ import "gonn/tensor"
 // Upsample upsamples (N, C, H, W) tensors by an integer ScaleFactor.
 // Mode "nearest" repeats each cell; "bilinear" performs bilinear interpolation.
 type Upsample struct {
+	Base
 	ScaleFactor int
 	Mode        string
 }
@@ -88,9 +89,6 @@ func (u *Upsample) Forward(x *tensor.Tensor) *tensor.Tensor {
 	}
 	panic("Upsample: unsupported mode")
 }
-
-// Parameters returns nothing.
-func (u *Upsample) Parameters() []*tensor.Tensor { return nil }
 
 func floorInt(v float64) float64 {
 	// math.Floor equivalent without importing math everywhere (avoid clash).

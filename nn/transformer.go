@@ -1,9 +1,14 @@
 package nn
 
-import "gonn/tensor"
+import (
+	"strconv"
+
+	"gonn/tensor"
+)
 
 // TransformerEncoderLayer uses post-norm: x = LN(x + attn(x)); x = LN(x + ff(x)).
 type TransformerEncoderLayer struct {
+	Base
 	Attn   *MultiHeadAttention
 	Norm1  *LayerNorm
 	FF1    *Linear
@@ -15,7 +20,7 @@ type TransformerEncoderLayer struct {
 
 // NewTransformerEncoderLayer constructs an encoder block.
 func NewTransformerEncoderLayer(embedDim, numHeads, dimFF int) *TransformerEncoderLayer {
-	return &TransformerEncoderLayer{
+	l := &TransformerEncoderLayer{
 		Attn:   NewMultiHeadAttention(embedDim, numHeads),
 		Norm1:  NewLayerNorm(embedDim),
 		FF1:    NewLinear(embedDim, dimFF, true),
@@ -24,6 +29,12 @@ func NewTransformerEncoderLayer(embedDim, numHeads, dimFF int) *TransformerEncod
 		DimFF:  dimFF,
 		EmbDim: embedDim,
 	}
+	l.regChild("attn", l.Attn)
+	l.regChild("norm1", l.Norm1)
+	l.regChild("ff1", l.FF1)
+	l.regChild("ff2", l.FF2)
+	l.regChild("norm2", l.Norm2)
+	return l
 }
 
 // Forward applies attention + FFN with residuals and post-norm.
@@ -34,29 +45,20 @@ func (l *TransformerEncoderLayer) Forward(x *tensor.Tensor) *tensor.Tensor {
 	return l.Norm2.Forward(x.Add(f))
 }
 
-// Parameters returns all sub-module parameters.
-func (l *TransformerEncoderLayer) Parameters() []*tensor.Tensor {
-	var ps []*tensor.Tensor
-	ps = append(ps, l.Attn.Parameters()...)
-	ps = append(ps, l.Norm1.Parameters()...)
-	ps = append(ps, l.FF1.Parameters()...)
-	ps = append(ps, l.FF2.Parameters()...)
-	ps = append(ps, l.Norm2.Parameters()...)
-	return ps
-}
-
 // TransformerEncoder stacks N encoder layers.
 type TransformerEncoder struct {
+	Base
 	Layers []*TransformerEncoderLayer
 }
 
 // NewTransformerEncoder builds N stacked encoder layers.
 func NewTransformerEncoder(numLayers, embedDim, numHeads, dimFF int) *TransformerEncoder {
-	ls := make([]*TransformerEncoderLayer, numLayers)
-	for i := range ls {
-		ls[i] = NewTransformerEncoderLayer(embedDim, numHeads, dimFF)
+	e := &TransformerEncoder{Layers: make([]*TransformerEncoderLayer, numLayers)}
+	for i := range e.Layers {
+		e.Layers[i] = NewTransformerEncoderLayer(embedDim, numHeads, dimFF)
+		e.regChild("layers."+strconv.Itoa(i), e.Layers[i])
 	}
-	return &TransformerEncoder{Layers: ls}
+	return e
 }
 
 // Forward applies each encoder layer in sequence.
@@ -67,17 +69,11 @@ func (e *TransformerEncoder) Forward(x *tensor.Tensor) *tensor.Tensor {
 	return x
 }
 
-// Parameters returns all layer parameters.
-func (e *TransformerEncoder) Parameters() []*tensor.Tensor {
-	var ps []*tensor.Tensor
-	for _, l := range e.Layers {
-		ps = append(ps, l.Parameters()...)
-	}
-	return ps
-}
-
 // TransformerDecoderLayer is post-norm: self-attn, cross-attn, FFN.
+// It takes (tgt, memory), so it satisfies Child but not Module; ForwardModule
+// adapts it to single-input use.
 type TransformerDecoderLayer struct {
+	Base
 	SelfAttn  *MultiHeadAttention
 	Norm1     *LayerNorm
 	CrossAttn *MultiHeadAttention
@@ -89,7 +85,7 @@ type TransformerDecoderLayer struct {
 
 // NewTransformerDecoderLayer constructs a decoder block.
 func NewTransformerDecoderLayer(embedDim, numHeads, dimFF int) *TransformerDecoderLayer {
-	return &TransformerDecoderLayer{
+	l := &TransformerDecoderLayer{
 		SelfAttn:  NewMultiHeadAttention(embedDim, numHeads),
 		Norm1:     NewLayerNorm(embedDim),
 		CrossAttn: NewMultiHeadAttention(embedDim, numHeads),
@@ -98,6 +94,14 @@ func NewTransformerDecoderLayer(embedDim, numHeads, dimFF int) *TransformerDecod
 		FF2:       NewLinear(dimFF, embedDim, true),
 		Norm3:     NewLayerNorm(embedDim),
 	}
+	l.regChild("selfattn", l.SelfAttn)
+	l.regChild("norm1", l.Norm1)
+	l.regChild("crossattn", l.CrossAttn)
+	l.regChild("norm2", l.Norm2)
+	l.regChild("ff1", l.FF1)
+	l.regChild("ff2", l.FF2)
+	l.regChild("norm3", l.Norm3)
+	return l
 }
 
 // Forward runs causal self-attn on tgt, cross-attn over memory, then FFN.
@@ -110,37 +114,26 @@ func (l *TransformerDecoderLayer) Forward(tgt, memory *tensor.Tensor) *tensor.Te
 	return l.Norm3.Forward(x.Add(f))
 }
 
-// Parameters returns all sub-module parameters.
-func (l *TransformerDecoderLayer) Parameters() []*tensor.Tensor {
-	var ps []*tensor.Tensor
-	ps = append(ps, l.SelfAttn.Parameters()...)
-	ps = append(ps, l.Norm1.Parameters()...)
-	ps = append(ps, l.CrossAttn.Parameters()...)
-	ps = append(ps, l.Norm2.Parameters()...)
-	ps = append(ps, l.FF1.Parameters()...)
-	ps = append(ps, l.FF2.Parameters()...)
-	ps = append(ps, l.Norm3.Parameters()...)
-	return ps
-}
-
-// Forward — Module interface — uses tgt as both inputs (self-encoding). Use
-// the two-arg Forward for actual encoder-decoder use.
+// ForwardModule — Module-style single input — uses tgt as both inputs
+// (self-encoding). Use the two-arg Forward for actual encoder-decoder use.
 func (l *TransformerDecoderLayer) ForwardModule(x *tensor.Tensor) *tensor.Tensor {
 	return l.Forward(x, x)
 }
 
 // TransformerDecoder stacks N decoder layers over a shared memory.
 type TransformerDecoder struct {
+	Base
 	Layers []*TransformerDecoderLayer
 }
 
 // NewTransformerDecoder builds N stacked decoder layers.
 func NewTransformerDecoder(numLayers, embedDim, numHeads, dimFF int) *TransformerDecoder {
-	ls := make([]*TransformerDecoderLayer, numLayers)
-	for i := range ls {
-		ls[i] = NewTransformerDecoderLayer(embedDim, numHeads, dimFF)
+	d := &TransformerDecoder{Layers: make([]*TransformerDecoderLayer, numLayers)}
+	for i := range d.Layers {
+		d.Layers[i] = NewTransformerDecoderLayer(embedDim, numHeads, dimFF)
+		d.regChild("layers."+strconv.Itoa(i), d.Layers[i])
 	}
-	return &TransformerDecoder{Layers: ls}
+	return d
 }
 
 // Forward applies each decoder layer over (tgt, memory).
@@ -149,13 +142,4 @@ func (d *TransformerDecoder) Forward(tgt, memory *tensor.Tensor) *tensor.Tensor 
 		tgt = l.Forward(tgt, memory)
 	}
 	return tgt
-}
-
-// Parameters returns all layer parameters.
-func (d *TransformerDecoder) Parameters() []*tensor.Tensor {
-	var ps []*tensor.Tensor
-	for _, l := range d.Layers {
-		ps = append(ps, l.Parameters()...)
-	}
-	return ps
 }

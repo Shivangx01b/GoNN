@@ -92,4 +92,3 @@ func binOp(a, b *Tensor, op string) *Tensor {
 	}
 	return out
 }
-

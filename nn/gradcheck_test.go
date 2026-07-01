@@ -108,42 +108,42 @@ func TestGradCheckEmbedding(t *testing.T) {
 }
 
 func TestGradCheckConv1d(t *testing.T) {
-	c := NewConv1d(2, 3, 3, 2, 1, true)
+	c := NewConv1d(2, 3, 3, WithStride(2), WithPad(1))
 	x := seededRandn(4, 2, 2, 7).SetRequiresGrad(true)
 	loss := func() *tensor.Tensor { return c.Forward(x).Square().Mean() }
 	gradCheck(t, "Conv1d", loss, append(c.Parameters(), x), gcEps, gcTol, 0)
 }
 
 func TestGradCheckConv2d(t *testing.T) {
-	c := NewConv2d(2, 3, 3, 2, 1, true)
+	c := NewConv2d(2, 3, 3, WithStride(2), WithPad(1))
 	x := seededRandn(5, 2, 2, 6, 7).SetRequiresGrad(true)
 	loss := func() *tensor.Tensor { return c.Forward(x).Square().Mean() }
 	gradCheck(t, "Conv2d", loss, append(c.Parameters(), x), gcEps, gcTol, 40)
 }
 
 func TestGradCheckConv3d(t *testing.T) {
-	c := NewConv3d(2, 2, 2, 1, 0, true)
+	c := NewConv3d(2, 2, 2)
 	x := seededRandn(6, 1, 2, 3, 4, 4).SetRequiresGrad(true)
 	loss := func() *tensor.Tensor { return c.Forward(x).Square().Mean() }
 	gradCheck(t, "Conv3d", loss, append(c.Parameters(), x), gcEps, gcTol, 30)
 }
 
 func TestGradCheckConvTranspose2d(t *testing.T) {
-	c := NewConvTranspose2d(2, 3, 3, 2, 1, true)
+	c := NewConvTranspose2d(2, 3, 3, WithStride(2), WithPad(1))
 	x := seededRandn(7, 2, 2, 4, 4).SetRequiresGrad(true)
 	loss := func() *tensor.Tensor { return c.Forward(x).Square().Mean() }
 	gradCheck(t, "ConvTranspose2d", loss, append(c.Parameters(), x), gcEps, gcTol, 40)
 }
 
 func TestGradCheckMaxPool2d(t *testing.T) {
-	p := NewMaxPool2d(2, 2)
+	p := NewMaxPool2d(2)
 	x := seededRandn(8, 2, 2, 4, 4).SetRequiresGrad(true)
 	loss := func() *tensor.Tensor { return p.Forward(x).Square().Mean() }
 	gradCheck(t, "MaxPool2d", loss, []*tensor.Tensor{x}, gcEps, gcTol, 0)
 }
 
 func TestGradCheckAvgPool3d(t *testing.T) {
-	p := NewAvgPool3d(2, 2)
+	p := NewAvgPool3d(2)
 	x := seededRandn(9, 2, 1, 4, 4, 4).SetRequiresGrad(true)
 	loss := func() *tensor.Tensor { return p.Forward(x).Square().Mean() }
 	gradCheck(t, "AvgPool3d", loss, []*tensor.Tensor{x}, gcEps, gcTol, 40)
@@ -180,7 +180,7 @@ func TestGradCheckGroupNorm(t *testing.T) {
 }
 
 func TestGradCheckInstanceNorm2d(t *testing.T) {
-	in := NewInstanceNorm2d(2, true)
+	in := NewInstanceNorm2d(2, WithAffine(true))
 	x := seededRandn(14, 2, 2, 4, 4).SetRequiresGrad(true)
 	loss := func() *tensor.Tensor { return in.Forward(x).Square().Mean() }
 	gradCheck(t, "InstanceNorm2d", loss, append(in.Parameters(), x), gcEps, gcTol, 40)
@@ -194,7 +194,7 @@ func TestGradCheckPReLU(t *testing.T) {
 }
 
 func TestGradCheckGLU(t *testing.T) {
-	g := GLU{Dim: -1}
+	g := NewGLU(-1)
 	x := seededRandn(16, 3, 8).SetRequiresGrad(true)
 	loss := func() *tensor.Tensor { return g.Forward(x).Square().Mean() }
 	gradCheck(t, "GLU", loss, []*tensor.Tensor{x}, gcEps, gcTol, 0)
@@ -246,7 +246,7 @@ func TestGradCheckRNNFamily(t *testing.T) {
 }
 
 func TestGradCheckMultiLayerLSTM(t *testing.T) {
-	l := NewMultiLayerLSTM(3, 4, 2, true)
+	l := NewLSTM(3, 4, WithLayers(2), WithBidirectional())
 	x := seededRandn(20, 2, 3, 3).SetRequiresGrad(true)
 	loss := func() *tensor.Tensor { return l.Forward(x).Square().Mean() }
 	gradCheck(t, "MultiLayerLSTM", loss, append(l.Parameters(), x), gcEps, gcTol, 20)

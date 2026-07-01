@@ -30,7 +30,7 @@ func approx(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
 func TestMaxPool1dForward(t *testing.T) {
 	// (1,1,4): [1,3,2,5], k=2,s=2 -> [max(1,3), max(2,5)] = [3,5]
 	x := tensor.New([]float64{1, 3, 2, 5}, 1, 1, 4)
-	y := NewMaxPool1d(2, 2).Forward(x)
+	y := NewMaxPool1d(2).Forward(x)
 	if got := y.Shape; len(got) != 3 || got[0] != 1 || got[1] != 1 || got[2] != 2 {
 		t.Fatalf("MaxPool1d shape: got %v", got)
 	}
@@ -42,7 +42,7 @@ func TestMaxPool1dForward(t *testing.T) {
 func TestAvgPool1dForward(t *testing.T) {
 	// (1,1,4): [1,3,2,6], k=2,s=2 -> [2, 4]
 	x := tensor.New([]float64{1, 3, 2, 6}, 1, 1, 4)
-	y := NewAvgPool1d(2, 2).Forward(x)
+	y := NewAvgPool1d(2).Forward(x)
 	if !approx(y.Data[0], 2) || !approx(y.Data[1], 4) {
 		t.Fatalf("AvgPool1d: got %v want [2 4]", y.Data)
 	}
@@ -50,7 +50,7 @@ func TestAvgPool1dForward(t *testing.T) {
 
 func TestMaxPool1dGrad(t *testing.T) {
 	x := tensor.New([]float64{1, 3, 2, 5}, 1, 1, 4).SetRequiresGrad(true)
-	y := NewMaxPool1d(2, 2).Forward(x)
+	y := NewMaxPool1d(2).Forward(x)
 	gradFlows(t, "MaxPool1d", y.Sum(), x)
 }
 
@@ -58,7 +58,7 @@ func TestMaxPool3dForward(t *testing.T) {
 	// (1,1,2,2,2) full window k=2 -> single max over the 8 values.
 	data := []float64{1, 2, 3, 4, 5, 6, 7, 8}
 	x := tensor.New(data, 1, 1, 2, 2, 2)
-	y := NewMaxPool3d(2, 2).Forward(x)
+	y := NewMaxPool3d(2).Forward(x)
 	if got := y.Shape; len(got) != 5 || got[2] != 1 || got[3] != 1 || got[4] != 1 {
 		t.Fatalf("MaxPool3d shape: got %v", got)
 	}
@@ -70,7 +70,7 @@ func TestMaxPool3dForward(t *testing.T) {
 func TestAvgPool3dForward(t *testing.T) {
 	data := []float64{1, 2, 3, 4, 5, 6, 7, 8} // mean = 4.5
 	x := tensor.New(data, 1, 1, 2, 2, 2)
-	y := NewAvgPool3d(2, 2).Forward(x)
+	y := NewAvgPool3d(2).Forward(x)
 	if !approx(y.Data[0], 4.5) {
 		t.Fatalf("AvgPool3d: got %v want 4.5", y.Data[0])
 	}
@@ -79,7 +79,7 @@ func TestAvgPool3dForward(t *testing.T) {
 func TestAvgPool3dGrad(t *testing.T) {
 	data := []float64{1, 2, 3, 4, 5, 6, 7, 8}
 	x := tensor.New(data, 1, 1, 2, 2, 2).SetRequiresGrad(true)
-	y := NewAvgPool3d(2, 2).Forward(x)
+	y := NewAvgPool3d(2).Forward(x)
 	gradFlows(t, "AvgPool3d", y.Sum(), x)
 }
 
@@ -165,7 +165,7 @@ func TestBilinearGrad(t *testing.T) {
 func TestSoftminForward(t *testing.T) {
 	// Softmin should put the most mass on the smallest element.
 	x := tensor.New([]float64{1, 2, 3}, 1, 3)
-	y := Softmin{Axis: 1}.Forward(x)
+	y := NewSoftmin(1).Forward(x)
 	var sum float64
 	for _, v := range y.Data {
 		sum += v
@@ -181,7 +181,7 @@ func TestSoftminForward(t *testing.T) {
 func TestSoftmax2dForward(t *testing.T) {
 	// (1,2,1,1): channel softmax over [0,0] -> [0.5, 0.5]
 	x := tensor.New([]float64{0, 0}, 1, 2, 1, 1)
-	y := Softmax2d{}.Forward(x)
+	y := NewSoftmax2d().Forward(x)
 	if !approx(y.Data[0], 0.5) || !approx(y.Data[1], 0.5) {
 		t.Fatalf("Softmax2d: got %v want [0.5 0.5]", y.Data)
 	}
@@ -226,7 +226,7 @@ func TestPairwiseDistanceGrad(t *testing.T) {
 
 func TestIdentityForward(t *testing.T) {
 	x := tensor.New([]float64{1, 2, 3}, 3)
-	y := Identity{}.Forward(x)
+	y := NewIdentity().Forward(x)
 	for i := range x.Data {
 		if y.Data[i] != x.Data[i] {
 			t.Fatalf("Identity changed data at %d", i)

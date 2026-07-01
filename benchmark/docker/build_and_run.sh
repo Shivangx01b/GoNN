@@ -30,6 +30,10 @@ go build -tags cuda ./...
 echo "=== 3. Correctness: CUDA vs CPU on GPU ==="
 go run -tags cuda ./benchmark/verify
 
+echo "=== 3b. Unit tests with -tags cuda (incl. forced GPU dispatch + race) ==="
+go test -tags cuda -count=1 ./tensor/ ./backend/... ./nn/ ./optim/
+go test -tags cuda -race -count=1 -run 'TestUseCurrentConcurrent|TestCUDA' ./backend/ ./tensor/
+
 echo "=== 4. GoNN CUDA benchmark (per-call H2D/D2H) ==="
 go run -tags cuda ./benchmark/gonn
 

@@ -53,7 +53,7 @@ func TestLinearBackpropTrains(t *testing.T) {
 func TestSequentialMLPForwardShape(t *testing.T) {
 	m := NewSequential(
 		NewLinear(8, 16, true),
-		ReLU{},
+		ReLU(),
 		NewLinear(16, 4, true),
 	)
 	x := tensor.Randn(5, 8)
@@ -97,10 +97,10 @@ func TestMSELossGradient(t *testing.T) {
 
 func TestActivationModulesPassThrough(t *testing.T) {
 	x := tensor.New([]float64{-1, 0, 1}, 3)
-	if g := (ReLU{}).Forward(x).Data; g[0] != 0 || g[1] != 0 || g[2] != 1 {
+	if g := ReLU().Forward(x).Data; g[0] != 0 || g[1] != 0 || g[2] != 1 {
 		t.Fatalf("ReLU: got %v", g)
 	}
-	if g := (Sigmoid{}).Forward(x).Data; math.Abs(g[1]-0.5) > 1e-9 {
+	if g := Sigmoid().Forward(x).Data; math.Abs(g[1]-0.5) > 1e-9 {
 		t.Fatalf("Sigmoid(0) != 0.5, got %v", g[1])
 	}
 }

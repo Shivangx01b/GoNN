@@ -1,149 +1,65 @@
 package nn
 
 import (
+	"fmt"
+	"strconv"
+
 	"gonn/tensor"
 )
 
-// RNN is a single-layer Elman RNN with tanh nonlinearity.
-// Input: (batch, seq_len, input_size). Output: (batch, seq_len, hidden_size).
-type RNN struct {
-	InputSize  int
-	HiddenSize int
-	Wih        *Linear // x_t -> hidden
-	Whh        *Linear // h_{t-1} -> hidden
+// Recurrent layers. The single-timestep cells (RNNCell/LSTMCell/GRUCell) are
+// the weight-owning primitives; RNN/LSTM/GRU stack them into (optionally
+// bidirectional) multi-layer networks. The default configuration — one
+// layer, unidirectional — matches the historical single-layer types, with
+// identical weight layouts and RNG draw order.
+//
+// All layer variants take input of shape (B, T, F) and return (B, T, H_out)
+// where H_out = HiddenSize if unidirectional, else 2*HiddenSize.
+
+// RNNOpt configures RNN/LSTM/GRU stacks.
+type RNNOpt func(*rnnOpts)
+
+type rnnOpts struct {
+	layers int
+	bidir  bool
 }
 
-// NewRNN builds a single-layer RNN.
-func NewRNN(inputSize, hiddenSize int) *RNN {
-	return &RNN{
-		InputSize:  inputSize,
-		HiddenSize: hiddenSize,
-		Wih:        NewLinear(inputSize, hiddenSize, true),
-		Whh:        NewLinear(hiddenSize, hiddenSize, false),
+// WithLayers sets the number of stacked layers (default 1).
+func WithLayers(n int) RNNOpt { return func(o *rnnOpts) { o.layers = n } }
+
+// WithBidirectional adds a reverse-direction cell per layer; the two streams
+// are concatenated along the feature axis.
+func WithBidirectional() RNNOpt { return func(o *rnnOpts) { o.bidir = true } }
+
+func resolveRNNOpts(opts []RNNOpt) rnnOpts {
+	o := rnnOpts{layers: 1}
+	for _, fn := range opts {
+		fn(&o)
 	}
-}
-
-// Forward unrolls the RNN over the sequence dim.
-func (r *RNN) Forward(x *tensor.Tensor) *tensor.Tensor {
-	if len(x.Shape) != 3 {
-		panic("RNN.Forward: expected (batch, seq, input_size)")
+	if o.layers < 1 {
+		panic(fmt.Sprintf("nn: rnn layers must be >= 1, got %d", o.layers))
 	}
-	B, T, _ := x.Shape[0], x.Shape[1], x.Shape[2]
-	h := tensor.Zeros(B, r.HiddenSize)
-	outs := make([]*tensor.Tensor, T)
-	for t := 0; t < T; t++ {
-		xt := sliceTime(x, t) // (B, input_size)
-		h = r.Wih.Forward(xt).Add(r.Whh.Forward(h)).Tanh()
-		outs[t] = h
+	return o
+}
+
+// layerInputSize returns the input size of stack layer i.
+func layerInputSize(i, in, hidden int, bidir bool) int {
+	if i == 0 {
+		return in
 	}
-	return stackTime(outs, B, T, r.HiddenSize)
-}
-
-// Parameters returns parameters of Wih and Whh.
-func (r *RNN) Parameters() []*tensor.Tensor {
-	return append(r.Wih.Parameters(), r.Whh.Parameters()...)
-}
-
-// LSTM is a single-layer LSTM.
-type LSTM struct {
-	InputSize  int
-	HiddenSize int
-	Wih        *Linear // x -> 4H (i, f, g, o)
-	Whh        *Linear // h -> 4H
-}
-
-// NewLSTM builds a single-layer LSTM.
-func NewLSTM(inputSize, hiddenSize int) *LSTM {
-	return &LSTM{
-		InputSize:  inputSize,
-		HiddenSize: hiddenSize,
-		Wih:        NewLinear(inputSize, 4*hiddenSize, true),
-		Whh:        NewLinear(hiddenSize, 4*hiddenSize, false),
+	if bidir {
+		return 2 * hidden
 	}
-}
-
-// Forward unrolls the LSTM. Returns the hidden-state sequence.
-func (l *LSTM) Forward(x *tensor.Tensor) *tensor.Tensor {
-	if len(x.Shape) != 3 {
-		panic("LSTM.Forward: expected (batch, seq, input_size)")
-	}
-	B, T, _ := x.Shape[0], x.Shape[1], x.Shape[2]
-	H := l.HiddenSize
-	h := tensor.Zeros(B, H)
-	c := tensor.Zeros(B, H)
-	outs := make([]*tensor.Tensor, T)
-	for t := 0; t < T; t++ {
-		xt := sliceTime(x, t)
-		gates := l.Wih.Forward(xt).Add(l.Whh.Forward(h)) // (B, 4H)
-		i := sliceCol(gates, 0, H).Sigmoid()
-		f := sliceCol(gates, H, 2*H).Sigmoid()
-		g := sliceCol(gates, 2*H, 3*H).Tanh()
-		o := sliceCol(gates, 3*H, 4*H).Sigmoid()
-		c = f.Mul(c).Add(i.Mul(g))
-		h = o.Mul(c.Tanh())
-		outs[t] = h
-	}
-	return stackTime(outs, B, T, H)
-}
-
-// Parameters returns Wih + Whh params.
-func (l *LSTM) Parameters() []*tensor.Tensor {
-	return append(l.Wih.Parameters(), l.Whh.Parameters()...)
-}
-
-// GRU is a single-layer GRU.
-type GRU struct {
-	InputSize  int
-	HiddenSize int
-	Wih        *Linear // x -> 3H (r, z, n)
-	Whh        *Linear // h -> 3H
-}
-
-// NewGRU builds a single-layer GRU.
-func NewGRU(inputSize, hiddenSize int) *GRU {
-	return &GRU{
-		InputSize:  inputSize,
-		HiddenSize: hiddenSize,
-		Wih:        NewLinear(inputSize, 3*hiddenSize, true),
-		Whh:        NewLinear(hiddenSize, 3*hiddenSize, true),
-	}
-}
-
-// Forward unrolls the GRU. Returns the hidden-state sequence.
-func (g *GRU) Forward(x *tensor.Tensor) *tensor.Tensor {
-	if len(x.Shape) != 3 {
-		panic("GRU.Forward: expected (batch, seq, input_size)")
-	}
-	B, T, _ := x.Shape[0], x.Shape[1], x.Shape[2]
-	H := g.HiddenSize
-	h := tensor.Zeros(B, H)
-	outs := make([]*tensor.Tensor, T)
-	one := tensor.Scalar(1)
-	for t := 0; t < T; t++ {
-		xt := sliceTime(x, t)
-		xg := g.Wih.Forward(xt)
-		hg := g.Whh.Forward(h)
-		rGate := sliceCol(xg, 0, H).Add(sliceCol(hg, 0, H)).Sigmoid()
-		zGate := sliceCol(xg, H, 2*H).Add(sliceCol(hg, H, 2*H)).Sigmoid()
-		nGate := sliceCol(xg, 2*H, 3*H).Add(rGate.Mul(sliceCol(hg, 2*H, 3*H))).Tanh()
-		h = one.Sub(zGate).Mul(nGate).Add(zGate.Mul(h))
-		outs[t] = h
-	}
-	return stackTime(outs, B, T, H)
-}
-
-// Parameters returns Wih + Whh params.
-func (g *GRU) Parameters() []*tensor.Tensor {
-	return append(g.Wih.Parameters(), g.Whh.Parameters()...)
+	return hidden
 }
 
 // ============================================================================
-// Single-timestep cells. These let callers drive the recurrence themselves,
-// which is useful for multi-layer/bidirectional stacks and seq2seq decoders.
+// Single-timestep cells
 // ============================================================================
 
 // RNNCell is a single Elman RNN step: h_t = tanh(W_ih x + W_hh h_{t-1}).
 type RNNCell struct {
+	Base
 	InputSize  int
 	HiddenSize int
 	Wih        *Linear
@@ -152,26 +68,24 @@ type RNNCell struct {
 
 // NewRNNCell creates an RNNCell.
 func NewRNNCell(in, hidden int) *RNNCell {
-	return &RNNCell{
+	c := &RNNCell{
 		InputSize:  in,
 		HiddenSize: hidden,
 		Wih:        NewLinear(in, hidden, true),
 		Whh:        NewLinear(hidden, hidden, false),
 	}
+	c.regChild("wih", c.Wih)
+	c.regChild("whh", c.Whh)
+	return c
 }
 
-// Forward consumes one timestep. x: (B, in); h: (B, hidden) (use zeros for t=0).
+// Forward consumes one timestep. x: (B, in); h: (B, hidden) (use nil for t=0).
 // Returns new h of shape (B, hidden).
 func (c *RNNCell) Forward(x, h *tensor.Tensor) *tensor.Tensor {
 	if h == nil {
 		h = tensor.Zeros(x.Shape[0], c.HiddenSize)
 	}
 	return c.Wih.Forward(x).Add(c.Whh.Forward(h)).Tanh()
-}
-
-// Parameters returns the cell's parameters.
-func (c *RNNCell) Parameters() []*tensor.Tensor {
-	return append(c.Wih.Parameters(), c.Whh.Parameters()...)
 }
 
 // LSTMState bundles the hidden and cell state of an LSTM cell.
@@ -182,6 +96,7 @@ type LSTMState struct {
 
 // LSTMCell is a single LSTM step.
 type LSTMCell struct {
+	Base
 	InputSize  int
 	HiddenSize int
 	Wih        *Linear // x -> 4H (i, f, g, o)
@@ -190,12 +105,15 @@ type LSTMCell struct {
 
 // NewLSTMCell creates an LSTMCell.
 func NewLSTMCell(in, hidden int) *LSTMCell {
-	return &LSTMCell{
+	c := &LSTMCell{
 		InputSize:  in,
 		HiddenSize: hidden,
 		Wih:        NewLinear(in, 4*hidden, true),
 		Whh:        NewLinear(hidden, 4*hidden, false),
 	}
+	c.regChild("wih", c.Wih)
+	c.regChild("whh", c.Whh)
+	return c
 }
 
 // Forward consumes one timestep. x: (B, in); state may be nil for t=0.
@@ -216,13 +134,9 @@ func (c *LSTMCell) Forward(x *tensor.Tensor, state *LSTMState) *LSTMState {
 	return &LSTMState{H: hNew, C: cNew}
 }
 
-// Parameters returns the cell's parameters.
-func (c *LSTMCell) Parameters() []*tensor.Tensor {
-	return append(c.Wih.Parameters(), c.Whh.Parameters()...)
-}
-
 // GRUCell is a single GRU step.
 type GRUCell struct {
+	Base
 	InputSize  int
 	HiddenSize int
 	Wih        *Linear // x -> 3H (r, z, n)
@@ -231,12 +145,15 @@ type GRUCell struct {
 
 // NewGRUCell creates a GRUCell.
 func NewGRUCell(in, hidden int) *GRUCell {
-	return &GRUCell{
+	c := &GRUCell{
 		InputSize:  in,
 		HiddenSize: hidden,
 		Wih:        NewLinear(in, 3*hidden, true),
 		Whh:        NewLinear(hidden, 3*hidden, true),
 	}
+	c.regChild("wih", c.Wih)
+	c.regChild("whh", c.Whh)
+	return c
 }
 
 // Forward consumes one timestep. x: (B, in); h: (B, hidden) or nil.
@@ -255,51 +172,218 @@ func (c *GRUCell) Forward(x, h *tensor.Tensor) *tensor.Tensor {
 	return one.Sub(zGate).Mul(nGate).Add(zGate.Mul(h))
 }
 
-// Parameters returns the cell's parameters.
-func (c *GRUCell) Parameters() []*tensor.Tensor {
-	return append(c.Wih.Parameters(), c.Whh.Parameters()...)
-}
+// ============================================================================
+// Direction runners
+// ============================================================================
 
-// sliceTime returns x[:, t, :] for a (B, T, F) tensor as (B, F).
-// Implemented as a gather-style matmul so autograd is preserved.
-func sliceTime(x *tensor.Tensor, t int) *tensor.Tensor {
-	B, T, F := x.Shape[0], x.Shape[1], x.Shape[2]
-	// Build selector S of shape (1, T) with 1 at position t.
-	sel := tensor.Zeros(1, T)
-	sel.Data[t] = 1
-	// reshape x to (B, T, F) -> view as (B*T, F) and gather via row selection per batch.
-	// Use the fact x[:, t, :] = einsum('btf,t->bf', x, sel_row).
-	// We can implement as: x reshaped to (B, T*F), times a (T*F, F) selector.
-	// Easier: build a (B*T, B) one-hot? No. Use this: reshape x to (B, T, F),
-	// permute to (B, F, T), then matmul with sel^T (T,1) -> (B, F, 1) -> (B, F).
-	xPerm := x.Permute(0, 2, 1).Reshape(B*F, T) // (B*F, T)
-	out := xPerm.MatMul(sel.Reshape(T, 1))      // (B*F, 1)
-	return out.Reshape(B, F)
-}
-
-// stackTime stacks T tensors of shape (B, H) into (B, T, H) using broadcasted
-// multiplies and adds so autograd works without relying on Concat.
-func stackTime(hs []*tensor.Tensor, B, T, H int) *tensor.Tensor {
-	out := tensor.Zeros(B, T, H)
-	for t, h := range hs {
-		// selector e of shape (1, T, 1) with 1 at position t.
-		sel := tensor.Zeros(1, T, 1)
-		sel.Data[t] = 1
-		placed := h.Reshape(B, 1, H).Mul(sel) // (B, T, H)
-		out = out.Add(placed)
+// runRNNDir runs one RNNCell over x (B, T, F) in either time order. (B,T,H).
+func runRNNDir(cell *RNNCell, x *tensor.Tensor, reverse bool) *tensor.Tensor {
+	B, T := x.Shape[0], x.Shape[1]
+	outs := make([]*tensor.Tensor, T)
+	var h *tensor.Tensor
+	for step := 0; step < T; step++ {
+		t := step
+		if reverse {
+			t = T - 1 - step
+		}
+		h = cell.Forward(sliceTime(x, t), h)
+		outs[t] = h
 	}
-	return out
+	return stackTime(outs, B, T, cell.HiddenSize)
 }
 
-// sliceCol returns x[:, lo:hi] for a 2D tensor (B, N).
-func sliceCol(x *tensor.Tensor, lo, hi int) *tensor.Tensor {
-	B, N := x.Shape[0], x.Shape[1]
-	w := hi - lo
-	// Build a (N, w) selector: identity rows from lo..hi-1.
-	sel := tensor.Zeros(N, w)
-	for j := 0; j < w; j++ {
-		sel.Data[(lo+j)*w+j] = 1
+// runLSTMDir runs one LSTMCell over x in either direction. (B,T,H).
+func runLSTMDir(cell *LSTMCell, x *tensor.Tensor, reverse bool) *tensor.Tensor {
+	B, T := x.Shape[0], x.Shape[1]
+	outs := make([]*tensor.Tensor, T)
+	var state *LSTMState
+	for step := 0; step < T; step++ {
+		t := step
+		if reverse {
+			t = T - 1 - step
+		}
+		state = cell.Forward(sliceTime(x, t), state)
+		outs[t] = state.H
 	}
-	_ = B
-	return x.MatMul(sel)
+	return stackTime(outs, B, T, cell.HiddenSize)
+}
+
+// runGRUDir runs one GRUCell over x in either direction. (B,T,H).
+func runGRUDir(cell *GRUCell, x *tensor.Tensor, reverse bool) *tensor.Tensor {
+	B, T := x.Shape[0], x.Shape[1]
+	outs := make([]*tensor.Tensor, T)
+	var h *tensor.Tensor
+	for step := 0; step < T; step++ {
+		t := step
+		if reverse {
+			t = T - 1 - step
+		}
+		h = cell.Forward(sliceTime(x, t), h)
+		outs[t] = h
+	}
+	return stackTime(outs, B, T, cell.HiddenSize)
+}
+
+// ============================================================================
+// Stacked (optionally bidirectional) layers
+// ============================================================================
+
+// RNN is a stack of Elman RNN layers (tanh nonlinearity), optionally
+// bidirectional. Default: one layer, unidirectional.
+type RNN struct {
+	Base
+	Cells         []*RNNCell // forward direction, one per layer
+	BackCells     []*RNNCell // reverse direction (nil if !Bidirectional)
+	NumLayers     int
+	HiddenSize    int
+	Bidirectional bool
+}
+
+// NewRNN builds an RNN stack: NewRNN(in, hidden), or with options
+// NewRNN(in, hidden, WithLayers(2), WithBidirectional()).
+func NewRNN(in, hidden int, opts ...RNNOpt) *RNN {
+	o := resolveRNNOpts(opts)
+	r := &RNN{NumLayers: o.layers, HiddenSize: hidden, Bidirectional: o.bidir}
+	r.Cells = make([]*RNNCell, o.layers)
+	if o.bidir {
+		r.BackCells = make([]*RNNCell, o.layers)
+	}
+	for i := 0; i < o.layers; i++ {
+		layerIn := layerInputSize(i, in, hidden, o.bidir)
+		r.Cells[i] = NewRNNCell(layerIn, hidden)
+		if o.bidir {
+			r.BackCells[i] = NewRNNCell(layerIn, hidden)
+		}
+	}
+	for i, c := range r.Cells {
+		r.regChild("cells."+strconv.Itoa(i), c)
+	}
+	for i, c := range r.BackCells {
+		r.regChild("backcells."+strconv.Itoa(i), c)
+	}
+	return r
+}
+
+// Forward runs the stack. x: (B, T, F). Returns (B, T, H) or (B, T, 2H).
+func (r *RNN) Forward(x *tensor.Tensor) *tensor.Tensor {
+	if len(x.Shape) != 3 {
+		panic("RNN.Forward: expected (B, T, F)")
+	}
+	cur := x
+	for li := 0; li < r.NumLayers; li++ {
+		fwd := runRNNDir(r.Cells[li], cur, false)
+		if !r.Bidirectional {
+			cur = fwd
+			continue
+		}
+		bwd := runRNNDir(r.BackCells[li], cur, true)
+		cur = tensor.Concat(2, fwd, bwd)
+	}
+	return cur
+}
+
+// LSTM is a stack of LSTM layers, optionally bidirectional.
+// Default: one layer, unidirectional.
+type LSTM struct {
+	Base
+	Cells         []*LSTMCell
+	BackCells     []*LSTMCell
+	NumLayers     int
+	HiddenSize    int
+	Bidirectional bool
+}
+
+// NewLSTM builds an LSTM stack.
+func NewLSTM(in, hidden int, opts ...RNNOpt) *LSTM {
+	o := resolveRNNOpts(opts)
+	l := &LSTM{NumLayers: o.layers, HiddenSize: hidden, Bidirectional: o.bidir}
+	l.Cells = make([]*LSTMCell, o.layers)
+	if o.bidir {
+		l.BackCells = make([]*LSTMCell, o.layers)
+	}
+	for i := 0; i < o.layers; i++ {
+		layerIn := layerInputSize(i, in, hidden, o.bidir)
+		l.Cells[i] = NewLSTMCell(layerIn, hidden)
+		if o.bidir {
+			l.BackCells[i] = NewLSTMCell(layerIn, hidden)
+		}
+	}
+	for i, c := range l.Cells {
+		l.regChild("cells."+strconv.Itoa(i), c)
+	}
+	for i, c := range l.BackCells {
+		l.regChild("backcells."+strconv.Itoa(i), c)
+	}
+	return l
+}
+
+// Forward runs the stack. x: (B, T, F).
+func (l *LSTM) Forward(x *tensor.Tensor) *tensor.Tensor {
+	if len(x.Shape) != 3 {
+		panic("LSTM.Forward: expected (B, T, F)")
+	}
+	cur := x
+	for li := 0; li < l.NumLayers; li++ {
+		fwd := runLSTMDir(l.Cells[li], cur, false)
+		if !l.Bidirectional {
+			cur = fwd
+			continue
+		}
+		bwd := runLSTMDir(l.BackCells[li], cur, true)
+		cur = tensor.Concat(2, fwd, bwd)
+	}
+	return cur
+}
+
+// GRU is a stack of GRU layers, optionally bidirectional.
+// Default: one layer, unidirectional.
+type GRU struct {
+	Base
+	Cells         []*GRUCell
+	BackCells     []*GRUCell
+	NumLayers     int
+	HiddenSize    int
+	Bidirectional bool
+}
+
+// NewGRU builds a GRU stack.
+func NewGRU(in, hidden int, opts ...RNNOpt) *GRU {
+	o := resolveRNNOpts(opts)
+	g := &GRU{NumLayers: o.layers, HiddenSize: hidden, Bidirectional: o.bidir}
+	g.Cells = make([]*GRUCell, o.layers)
+	if o.bidir {
+		g.BackCells = make([]*GRUCell, o.layers)
+	}
+	for i := 0; i < o.layers; i++ {
+		layerIn := layerInputSize(i, in, hidden, o.bidir)
+		g.Cells[i] = NewGRUCell(layerIn, hidden)
+		if o.bidir {
+			g.BackCells[i] = NewGRUCell(layerIn, hidden)
+		}
+	}
+	for i, c := range g.Cells {
+		g.regChild("cells."+strconv.Itoa(i), c)
+	}
+	for i, c := range g.BackCells {
+		g.regChild("backcells."+strconv.Itoa(i), c)
+	}
+	return g
+}
+
+// Forward runs the stack. x: (B, T, F).
+func (g *GRU) Forward(x *tensor.Tensor) *tensor.Tensor {
+	if len(x.Shape) != 3 {
+		panic("GRU.Forward: expected (B, T, F)")
+	}
+	cur := x
+	for li := 0; li < g.NumLayers; li++ {
+		fwd := runGRUDir(g.Cells[li], cur, false)
+		if !g.Bidirectional {
+			cur = fwd
+			continue
+		}
+		bwd := runGRUDir(g.BackCells[li], cur, true)
+		cur = tensor.Concat(2, fwd, bwd)
+	}
+	return cur
 }

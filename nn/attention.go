@@ -7,7 +7,9 @@ import (
 )
 
 // MultiHeadAttention implements scaled dot-product multi-head attention.
+// It takes three inputs (q, k, v), so it satisfies Child but not Module.
 type MultiHeadAttention struct {
+	Base
 	EmbedDim int
 	NumHeads int
 	HeadDim  int
@@ -22,7 +24,7 @@ func NewMultiHeadAttention(embedDim, numHeads int) *MultiHeadAttention {
 	if embedDim%numHeads != 0 {
 		panic("MultiHeadAttention: embedDim must be divisible by numHeads")
 	}
-	return &MultiHeadAttention{
+	m := &MultiHeadAttention{
 		EmbedDim: embedDim,
 		NumHeads: numHeads,
 		HeadDim:  embedDim / numHeads,
@@ -31,6 +33,11 @@ func NewMultiHeadAttention(embedDim, numHeads int) *MultiHeadAttention {
 		VProj:    NewLinear(embedDim, embedDim, true),
 		OutProj:  NewLinear(embedDim, embedDim, true),
 	}
+	m.regChild("qproj", m.QProj)
+	m.regChild("kproj", m.KProj)
+	m.regChild("vproj", m.VProj)
+	m.regChild("outproj", m.OutProj)
+	return m
 }
 
 // Forward computes MHA. q,k,v shapes: (batch, seq, embed). If causal is true,
@@ -62,9 +69,8 @@ func (m *MultiHeadAttention) Forward(q, k, v *tensor.Tensor, causal bool) *tenso
 		return m.OutProj.Forward(ctx)
 	}
 
-	// scores = qp @ kp^T -> (B, H, Tq, Tk)
-	scores := batchedMatMul(qp, transposeLastTwo(kp))
-	scores = scores.MulScalar(scale)
+	// scores = qp @ kp^T -> (B, H, Tq, Tk); batched matmul over the head dims.
+	scores := qp.MatMul(kp.Transpose()).MulScalar(scale)
 
 	if causal {
 		mask := tensor.Zeros(1, 1, Tq, Tk)
@@ -81,7 +87,7 @@ func (m *MultiHeadAttention) Forward(q, k, v *tensor.Tensor, causal bool) *tenso
 
 	attn := scores.Softmax(3) // softmax over Tk
 	// ctx = attn @ vp -> (B, H, Tq, D)
-	ctx := batchedMatMul(attn, vp)
+	ctx := attn.MatMul(vp)
 	// (B, H, Tq, D) -> (B, Tq, H, D) -> (B, Tq, E)
 	ctx = ctx.Permute(0, 2, 1, 3).Reshape(B, Tq, m.EmbedDim)
 	return m.OutProj.Forward(ctx)
@@ -116,78 +122,4 @@ func (m *MultiHeadAttention) ForwardFused(q, k, v *tensor.Tensor, causal bool) *
 
 	ctx := tensor.New(O, B, H, Tq, D).Permute(0, 2, 1, 3).Reshape(B, Tq, m.EmbedDim)
 	return m.OutProj.Forward(ctx)
-}
-
-// Parameters returns all linear projection parameters.
-func (m *MultiHeadAttention) Parameters() []*tensor.Tensor {
-	var ps []*tensor.Tensor
-	ps = append(ps, m.QProj.Parameters()...)
-	ps = append(ps, m.KProj.Parameters()...)
-	ps = append(ps, m.VProj.Parameters()...)
-	ps = append(ps, m.OutProj.Parameters()...)
-	return ps
-}
-
-// batchedMatMul performs matmul on the last two dims of 4D tensors
-// a: (B, H, M, K), b: (B, H, K, N) -> (B, H, M, N).
-// Implemented via reshape to (B*H, M, K) and pair-wise 2D matmul; we flatten
-// further to a single big matmul by folding B*H into M when shapes allow.
-func batchedMatMul(a, b *tensor.Tensor) *tensor.Tensor {
-	// Expect 4D inputs.
-	B, H, M, K := a.Shape[0], a.Shape[1], a.Shape[2], a.Shape[3]
-	K2, N := b.Shape[2], b.Shape[3]
-	if K != K2 || B != b.Shape[0] || H != b.Shape[1] {
-		panic("batchedMatMul: shape mismatch")
-	}
-	// Build a block-diagonal of b matrices so a single 2D matmul covers all batches.
-	// a flat: (B*H*M, K) by reshape. b block: (B*H*K, B*H*N) by zero-padding.
-	// Then result[i, b*H*N + j] picks the right block. But this is sparse and
-	// memory-expensive. Instead, just loop and stack results.
-	out := tensor.Zeros(B, H, M, N)
-	// Per-batch 2D matmul, then "place" into out via broadcasted multiply-add.
-	// To keep autograd, do all ops in tensor space.
-	var summed *tensor.Tensor
-	for bi := 0; bi < B; bi++ {
-		for hi := 0; hi < H; hi++ {
-			aSlice := slice4DTo2D(a, bi, hi) // (M, K)
-			bSlice := slice4DTo2D(b, bi, hi) // (K, N)
-			prod := aSlice.MatMul(bSlice)    // (M, N)
-			placed := placeIn4D(prod, B, H, M, N, bi, hi)
-			if summed == nil {
-				summed = placed
-			} else {
-				summed = summed.Add(placed)
-			}
-		}
-	}
-	if summed == nil {
-		return out
-	}
-	return summed
-}
-
-// slice4DTo2D returns t[b, h, :, :] as (M, N) via a permuted reshape + masked matmul.
-// We can't slice directly so we use a one-hot selector.
-func slice4DTo2D(t *tensor.Tensor, bi, hi int) *tensor.Tensor {
-	B, H, M, N := t.Shape[0], t.Shape[1], t.Shape[2], t.Shape[3]
-	// reshape t to (B*H, M*N), then select row (bi*H+hi).
-	flat := t.Reshape(B*H, M*N)
-	sel := tensor.Zeros(1, B*H)
-	sel.Data[bi*H+hi] = 1
-	row := sel.MatMul(flat) // (1, M*N)
-	return row.Reshape(M, N)
-}
-
-// placeIn4D embeds a (M, N) tensor at position (bi, hi) of a (B, H, M, N) zero tensor.
-func placeIn4D(x *tensor.Tensor, B, H, M, N, bi, hi int) *tensor.Tensor {
-	// Build selector e of shape (B, H, 1, 1) with 1 at (bi, hi).
-	sel := tensor.Zeros(B, H, 1, 1)
-	sel.Data[bi*H+hi] = 1
-	xExp := x.Reshape(1, 1, M, N)
-	return xExp.Mul(sel) // broadcasts to (B, H, M, N)
-}
-
-// transposeLastTwo swaps the last two dims of a 4D tensor.
-func transposeLastTwo(t *tensor.Tensor) *tensor.Tensor {
-	return t.Permute(0, 1, 3, 2)
 }
