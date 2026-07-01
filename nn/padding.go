@@ -2,19 +2,20 @@ package nn
 
 import "gonn/tensor"
 
-// 2D padding layers, all built on indexMapGather (gather.go): each output
-// cell reads at most one input cell (or zero), so a single 0/1 gather matrix
-// expresses zero/reflection/replication padding.
+// 2D padding layers, built on the shared N-d padding machinery in
+// padding_nd.go: each output cell reads at most one input cell (or zero), so
+// a single 0/1 gather matrix (indexMapGather) expresses zero/constant/
+// reflection/replication padding as one matmul.
+//
+// Note: these historical 2D layers take (top, bottom, left, right); the
+// newer 1d/3d/circular layers in padding_nd.go follow PyTorch tuple order
+// (left, right, top, bottom, front, back).
 
-// applyPad2d applies a 2D padding selector to an (N, C, H, W) input.
-// indexMap describes where each output cell reads from in input flat indices,
-// or -1 for "zero fill".
-func applyPad2d(x *tensor.Tensor, outH, outW int, indexMap []int) *tensor.Tensor {
-	N, C, H, W := x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3]
-	g := indexMapGather(indexMap, H*W)
-	xFlat := x.Reshape(N*C, H*W)
-	out := xFlat.MatMul(g.Transpose()) // (N*C, outH*outW)
-	return out.Reshape(N, C, outH, outW)
+// pad2d validates a (N, C, H, W) input and applies mode padding.
+func pad2d(name string, x *tensor.Tensor, top, bottom, left, right int, mode padModeFunc) *tensor.Tensor {
+	checkRank(name, x, 4, "(N, C, H, W)")
+	out, im := padND(x.Shape[2:], []int{top, left}, []int{bottom, right}, mode)
+	return applyPadND(x, out, im)
 }
 
 // ZeroPad2d pads (N, C, H, W) with zeros on the four sides.
@@ -30,30 +31,7 @@ func NewZeroPad2d(top, bottom, left, right int) *ZeroPad2d {
 
 // Forward applies zero padding.
 func (p *ZeroPad2d) Forward(x *tensor.Tensor) *tensor.Tensor {
-	if len(x.Shape) != 4 {
-		panic("ZeroPad2d: expected 4D input")
-	}
-	H, W := x.Shape[2], x.Shape[3]
-	outH := H + p.Top + p.Bottom
-	outW := W + p.Left + p.Right
-	indexMap := make([]int, outH*outW)
-	for i := range indexMap {
-		indexMap[i] = -1
-	}
-	for oh := 0; oh < outH; oh++ {
-		ih := oh - p.Top
-		if ih < 0 || ih >= H {
-			continue
-		}
-		for ow := 0; ow < outW; ow++ {
-			iw := ow - p.Left
-			if iw < 0 || iw >= W {
-				continue
-			}
-			indexMap[oh*outW+ow] = ih*W + iw
-		}
-	}
-	return applyPad2d(x, outH, outW, indexMap)
+	return pad2d("ZeroPad2d", x, p.Top, p.Bottom, p.Left, p.Right, zeroPadIndex)
 }
 
 // ConstantPad2d pads with a fixed scalar Value.
@@ -70,33 +48,11 @@ func NewConstantPad2d(top, bottom, left, right int, value float64) *ConstantPad2
 
 // Forward applies constant padding.
 func (p *ConstantPad2d) Forward(x *tensor.Tensor) *tensor.Tensor {
-	if len(x.Shape) != 4 {
-		panic("ConstantPad2d: expected 4D input")
-	}
-	H, W := x.Shape[2], x.Shape[3]
-	outH := H + p.Top + p.Bottom
-	outW := W + p.Left + p.Right
-	indexMap := make([]int, outH*outW)
-	// fillMask[r] = Value on border cells.
-	fillMask := make([]float64, outH*outW)
-	for i := range indexMap {
-		indexMap[i] = -1
-	}
-	for oh := 0; oh < outH; oh++ {
-		ih := oh - p.Top
-		for ow := 0; ow < outW; ow++ {
-			iw := ow - p.Left
-			if ih >= 0 && ih < H && iw >= 0 && iw < W {
-				indexMap[oh*outW+ow] = ih*W + iw
-			} else {
-				fillMask[oh*outW+ow] = p.Value
-			}
-		}
-	}
-	gathered := applyPad2d(x, outH, outW, indexMap) // (N, C, outH, outW)
-	// Add border value tensor (broadcast over N, C).
-	fill := tensor.New(fillMask, 1, 1, outH, outW)
-	return gathered.Add(fill)
+	checkRank("ConstantPad2d", x, 4, "(N, C, H, W)")
+	out, im := padND(x.Shape[2:], []int{p.Top, p.Left}, []int{p.Bottom, p.Right}, zeroPadIndex)
+	// Gather the interior, then add the border value tensor (broadcast over
+	// N, C).
+	return applyPadND(x, out, im).Add(constantFill(out, im, p.Value))
 }
 
 // reflectIndex maps a (possibly out-of-range) coordinate to the reflected
@@ -142,21 +98,7 @@ func NewReflectionPad2d(top, bottom, left, right int) *ReflectionPad2d {
 
 // Forward applies reflection padding.
 func (p *ReflectionPad2d) Forward(x *tensor.Tensor) *tensor.Tensor {
-	if len(x.Shape) != 4 {
-		panic("ReflectionPad2d: expected 4D input")
-	}
-	H, W := x.Shape[2], x.Shape[3]
-	outH := H + p.Top + p.Bottom
-	outW := W + p.Left + p.Right
-	indexMap := make([]int, outH*outW)
-	for oh := 0; oh < outH; oh++ {
-		ih := reflectIndex(oh-p.Top, H)
-		for ow := 0; ow < outW; ow++ {
-			iw := reflectIndex(ow-p.Left, W)
-			indexMap[oh*outW+ow] = ih*W + iw
-		}
-	}
-	return applyPad2d(x, outH, outW, indexMap)
+	return pad2d("ReflectionPad2d", x, p.Top, p.Bottom, p.Left, p.Right, reflectIndex)
 }
 
 // ReplicationPad2d replicates the edge values.
@@ -172,19 +114,5 @@ func NewReplicationPad2d(top, bottom, left, right int) *ReplicationPad2d {
 
 // Forward applies replication (edge) padding.
 func (p *ReplicationPad2d) Forward(x *tensor.Tensor) *tensor.Tensor {
-	if len(x.Shape) != 4 {
-		panic("ReplicationPad2d: expected 4D input")
-	}
-	H, W := x.Shape[2], x.Shape[3]
-	outH := H + p.Top + p.Bottom
-	outW := W + p.Left + p.Right
-	indexMap := make([]int, outH*outW)
-	for oh := 0; oh < outH; oh++ {
-		ih := replicateIndex(oh-p.Top, H)
-		for ow := 0; ow < outW; ow++ {
-			iw := replicateIndex(ow-p.Left, W)
-			indexMap[oh*outW+ow] = ih*W + iw
-		}
-	}
-	return applyPad2d(x, outH, outW, indexMap)
+	return pad2d("ReplicationPad2d", x, p.Top, p.Bottom, p.Left, p.Right, replicateIndex)
 }
