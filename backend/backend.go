@@ -41,8 +41,9 @@ const (
 	UnaryTanh
 	UnaryExp
 	UnaryLog
-	UnaryGELU // tanh approximation: 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
-	UnarySiLU // x * sigmoid(x)
+	UnaryGELU      // tanh approximation: 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
+	UnarySiLU      // x * sigmoid(x)
+	UnaryGELUExact // 0.5*x*(1+erf(x/sqrt(2)))
 )
 
 // BinaryKind identifies an accelerated elementwise binary op. Same append-only

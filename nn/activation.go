@@ -2,6 +2,7 @@ package nn
 
 import (
 	"fmt"
+	"math/rand"
 
 	"gonn/tensor"
 )
@@ -48,6 +49,8 @@ func (a *Activation) Forward(x *tensor.Tensor) *tensor.Tensor {
 		return x.Softshrink(a.Alpha)
 	case "threshold":
 		return x.Threshold(a.Alpha, a.Beta)
+	case "softplusbeta":
+		return x.SoftplusBeta(a.Alpha, a.Beta)
 	default:
 		panic(fmt.Sprintf("nn: unknown parameterized activation %q", a.Kind))
 	}
@@ -69,6 +72,23 @@ func Tanh() *Activation { return fixedAct("tanh") }
 
 // GELU returns a GELU activation module (tanh approximation).
 func GELU() *Activation { return fixedAct("gelu") }
+
+// GELUExact returns the exact-erf GELU activation module:
+// 0.5*x*(1+erf(x/sqrt(2))), matching torch.nn.GELU(approximate='none').
+func GELUExact() *Activation { return fixedAct("geluexact") }
+
+// GELUApprox mirrors torch.nn.GELU(approximate=...): "none" selects the
+// exact-erf GELU, "tanh" the tanh approximation. Panics on any other value.
+func GELUApprox(approximate string) *Activation {
+	switch approximate {
+	case "none":
+		return fixedAct("geluexact")
+	case "tanh":
+		return fixedAct("gelu")
+	default:
+		panic(fmt.Sprintf("nn: GELUApprox: approximate must be %q or %q, got %q", "none", "tanh", approximate))
+	}
+}
 
 // SiLU returns a SiLU (Swish) activation module: x * sigmoid(x).
 func SiLU() *Activation { return fixedAct("silu") }
@@ -128,6 +148,14 @@ func Softshrink(lambda float64) *Activation {
 // Threshold returns a Threshold activation module: x if x > thresh else value.
 func Threshold(thresh, value float64) *Activation {
 	return &Activation{Kind: "threshold", Alpha: thresh, Beta: value, parameterized: true}
+}
+
+// SoftplusWith returns a parameterized Softplus activation module,
+// matching torch.nn.Softplus(beta, threshold):
+// (1/beta)*log(1+exp(beta*x)), linear where beta*x > threshold.
+// PyTorch defaults are beta=1, threshold=20 (== the zero-arg Softplus()).
+func SoftplusWith(beta, threshold float64) *Activation {
+	return &Activation{Kind: "softplusbeta", Alpha: beta, Beta: threshold, parameterized: true}
 }
 
 // ActivationByName returns an Activation for any registered fixed unary op
@@ -234,6 +262,47 @@ func (p *PReLU) Forward(x *tensor.Tensor) *tensor.Tensor {
 		w = p.Weight.Reshape(shape...)
 	}
 	return pos.Add(w.Mul(neg))
+}
+
+// RReLULayer is the randomized leaky ReLU module, mirroring torch.nn.RReLU:
+// y = x for x >= 0, y = slope*x for x < 0.
+//
+// Training mode: one slope is sampled uniformly from [Lower, Upper] per
+// forward call (math/rand) and applied to the WHOLE tensor via LeakyReLU.
+// DEVIATION from PyTorch: torch.nn.RReLU samples an independent slope per
+// element; sampling a single per-forward slope keeps the op inside the
+// framework's single fwd/bwd-closure unary shape. The slope distribution and
+// its expectation match PyTorch's; only the per-element independence differs.
+//
+// Eval mode: the deterministic midpoint slope (Lower+Upper)/2 via
+// tensor.RReLU, exactly PyTorch's eval-mode semantics.
+type RReLULayer struct {
+	Base
+	Lower, Upper float64
+	rng          *rand.Rand
+}
+
+// RReLU constructs a randomized leaky ReLU module sampling negative-region
+// slopes from U(lower, upper). PyTorch defaults are lower=1/8, upper=1/3.
+// The internal RNG is seeded from math/rand's global source; use Seed for
+// deterministic runs.
+func RReLU(lower, upper float64) *RReLULayer {
+	if lower > upper {
+		panic(fmt.Sprintf("nn: RReLU: lower (%v) must be <= upper (%v)", lower, upper))
+	}
+	return &RReLULayer{Lower: lower, Upper: upper, rng: rand.New(rand.NewSource(rand.Int63()))}
+}
+
+// Seed reseeds the module's slope RNG (for deterministic training or tests).
+func (r *RReLULayer) Seed(seed int64) { r.rng = rand.New(rand.NewSource(seed)) }
+
+// Forward applies the randomized (training) or midpoint (eval) leaky ReLU.
+func (r *RReLULayer) Forward(x *tensor.Tensor) *tensor.Tensor {
+	if r.Training() {
+		slope := r.Lower + r.rng.Float64()*(r.Upper-r.Lower)
+		return x.LeakyReLU(slope)
+	}
+	return x.RReLU(r.Lower, r.Upper, nil)
 }
 
 // GLU is the gated linear unit: split input into halves a, b along Dim and

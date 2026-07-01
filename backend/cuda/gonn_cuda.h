@@ -16,8 +16,9 @@ enum {
     GONN_UN_TANH,
     GONN_UN_EXP,
     GONN_UN_LOG,
-    GONN_UN_GELU,   /* tanh approximation */
-    GONN_UN_SILU    /* x * sigmoid(x) */
+    GONN_UN_GELU,       /* tanh approximation */
+    GONN_UN_SILU,       /* x * sigmoid(x) */
+    GONN_UN_GELU_EXACT  /* 0.5*x*(1+erf(x/sqrt(2))) — append only, never reorder */
 };
 enum {
     GONN_BIN_ADD = 0,

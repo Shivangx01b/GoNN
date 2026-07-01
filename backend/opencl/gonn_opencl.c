@@ -43,6 +43,7 @@ UN_K("expk",     "exp(x)")
 UN_K("logk",     "log(x)")
 UN_K("geluk",    "0.5*x*(1.0+tanh(0.7978845608028654*(x+0.044715*x*x*x)))")
 UN_K("siluk",    "x/(1.0+exp(-x))")
+UN_K("geluexactk", "0.5*x*(1.0+erf(x*0.7071067811865476))")
 BIN_K("addk", "a+b")
 BIN_K("subk", "a-b")
 BIN_K("mulk", "a*b")
@@ -120,7 +121,7 @@ static int init_cl(void) {
 int gonn_cl_available(void) { return init_cl() == 1; }
 
 // Kind -> kernel name tables (indexes match the enums in gonn_opencl.h).
-static const char* UNARY_NAMES[]  = {"reluk", "sigmoidk", "tanhk", "expk", "logk", "geluk", "siluk"};
+static const char* UNARY_NAMES[]  = {"reluk", "sigmoidk", "tanhk", "expk", "logk", "geluk", "siluk", "geluexactk"};
 static const char* BINARY_NAMES[] = {"addk", "subk", "mulk", "divk"};
 #define N_UNARY  ((int)(sizeof(UNARY_NAMES) / sizeof(UNARY_NAMES[0])))
 #define N_BINARY ((int)(sizeof(BINARY_NAMES) / sizeof(BINARY_NAMES[0])))

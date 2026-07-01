@@ -14,7 +14,8 @@ enum {
     GONN_CL_UN_EXP,
     GONN_CL_UN_LOG,
     GONN_CL_UN_GELU,
-    GONN_CL_UN_SILU
+    GONN_CL_UN_SILU,
+    GONN_CL_UN_GELU_EXACT  /* 0.5*x*(1+erf(x/sqrt(2))) — append only, never reorder */
 };
 enum {
     GONN_CL_BIN_ADD = 0,

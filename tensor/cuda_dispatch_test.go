@@ -62,6 +62,7 @@ func TestCUDAUnaryDispatchParity(t *testing.T) {
 		{"exp", (*Tensor).Exp},
 		{"gelu", (*Tensor).GELU},
 		{"silu", (*Tensor).SiLU},
+		{"geluexact", (*Tensor).GELUExact},
 	}
 	for _, op := range ops {
 		gpu := op.f(x)

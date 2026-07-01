@@ -123,6 +123,19 @@ var (
 			return g * (0.5*(1+tanh) + 0.5*x*sech2*dInner)
 		}}
 
+	// GELUExact is the exact-erf GELU (torch.nn.GELU(approximate='none')):
+	// 0.5*x*(1+erf(x/sqrt(2))). Backward is the analytic derivative
+	// Phi(x) + x*phi(x) where Phi is the standard-normal CDF and phi its PDF;
+	// 0.3989422804014327 = 1/sqrt(2*pi).
+	geluExactDef = UnaryOpDef{Name: "GELUExact", Kind: UnaryGELUExact,
+		Fwd: func(v float64) float64 {
+			return 0.5 * v * (1 + math.Erf(v/math.Sqrt2))
+		},
+		Bwd: func(g, x, y float64) float64 {
+			const invSqrt2Pi = 0.3989422804014327
+			return g * (0.5*(1+math.Erf(x/math.Sqrt2)) + x*math.Exp(-0.5*x*x)*invSqrt2Pi)
+		}}
+
 	siluDef = UnaryOpDef{Name: "SiLU", Kind: UnarySiLU,
 		Fwd: func(v float64) float64 { return v / (1 + math.Exp(-v)) },
 		Bwd: func(g, x, y float64) float64 {
@@ -212,6 +225,7 @@ func init() {
 	RegisterUnary(softplusDef)
 	RegisterUnary(softsignDef)
 	RegisterUnary(geluDef)
+	RegisterUnary(geluExactDef)
 	RegisterUnary(siluDef)
 	RegisterUnary(hardSwishDef)
 	RegisterUnary(mishDef)
@@ -246,6 +260,10 @@ func (t *Tensor) Softsign() *Tensor { return applyUnary(t, softsignDef) }
 
 // GELU using the tanh approximation (PyTorch default-compatible).
 func (t *Tensor) GELU() *Tensor { return applyUnary(t, geluDef) }
+
+// GELUExact is the exact-erf GELU: 0.5*x*(1+erf(x/sqrt(2))), matching
+// torch.nn.GELU(approximate='none').
+func (t *Tensor) GELUExact() *Tensor { return applyUnary(t, geluExactDef) }
 
 // SiLU (Swish) returns x * sigmoid(x).
 func (t *Tensor) SiLU() *Tensor { return applyUnary(t, siluDef) }
@@ -338,6 +356,34 @@ func (t *Tensor) Softshrink(lambda float64) *Tensor {
 				return g
 			}
 			return 0
+		}})
+}
+
+// SoftplusBeta is the parameterized Softplus, matching
+// torch.nn.Softplus(beta, threshold):
+//
+//	softplus(x) = (1/beta) * log(1 + exp(beta*x))
+//
+// reverting to the identity (linear) when beta*x > threshold for numerical
+// stability. PyTorch defaults are beta=1, threshold=20 — that case is the
+// zero-arg Softplus(), which is kept as its own fixed registered op.
+// Backward: g * sigmoid(beta*x), and pass-through g in the linear region.
+func (t *Tensor) SoftplusBeta(beta, threshold float64) *Tensor {
+	if beta == 0 {
+		opError("SoftplusBeta", "beta must be non-zero")
+	}
+	return applyUnary(t, UnaryOpDef{Name: "SoftplusBeta", Kind: UnaryNone,
+		Fwd: func(v float64) float64 {
+			if beta*v > threshold {
+				return v
+			}
+			return math.Log(1+math.Exp(beta*v)) / beta
+		},
+		Bwd: func(g, x, y float64) float64 {
+			if beta*x > threshold {
+				return g
+			}
+			return g / (1 + math.Exp(-beta*x))
 		}})
 }
 

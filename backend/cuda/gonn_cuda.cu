@@ -100,6 +100,8 @@ DEF_UNOP(log,     log(x))
 // GELU, tanh approximation; 0.7978845608028654 = sqrt(2/pi)
 DEF_UNOP(gelu,    0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x))))
 DEF_UNOP(silu,    x / (1.0 + exp(-x)))
+// Exact-erf GELU; 0.7071067811865476 = 1/sqrt(2)
+DEF_UNOP(gelu_exact, 0.5 * x * (1.0 + erf(x * 0.7071067811865476)))
 
 DEF_BINOP(add, a + b)
 DEF_BINOP(sub, a - b)
@@ -184,6 +186,7 @@ static int launch_unary(int kind, const double* dA, double* dC, long n) {
     case GONN_UN_LOG:     log_kernel<<<blocks, GONN_THREADS>>>(dA, dC, n); break;
     case GONN_UN_GELU:    gelu_kernel<<<blocks, GONN_THREADS>>>(dA, dC, n); break;
     case GONN_UN_SILU:    silu_kernel<<<blocks, GONN_THREADS>>>(dA, dC, n); break;
+    case GONN_UN_GELU_EXACT: gelu_exact_kernel<<<blocks, GONN_THREADS>>>(dA, dC, n); break;
     default:
         fprintf(stderr, "gonn_cuda: unknown unary kind %d\n", kind);
         return -1;

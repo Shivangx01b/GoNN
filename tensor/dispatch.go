@@ -30,14 +30,15 @@ type UnaryKind = backend.UnaryKind
 
 // Re-exported unary kernel kinds (see backend.UnaryKind for the ABI contract).
 const (
-	UnaryNone    = backend.UnaryNone
-	UnaryReLU    = backend.UnaryReLU
-	UnarySigmoid = backend.UnarySigmoid
-	UnaryTanh    = backend.UnaryTanh
-	UnaryExp     = backend.UnaryExp
-	UnaryLog     = backend.UnaryLog
-	UnaryGELU    = backend.UnaryGELU
-	UnarySiLU    = backend.UnarySiLU
+	UnaryNone      = backend.UnaryNone
+	UnaryReLU      = backend.UnaryReLU
+	UnarySigmoid   = backend.UnarySigmoid
+	UnaryTanh      = backend.UnaryTanh
+	UnaryExp       = backend.UnaryExp
+	UnaryLog       = backend.UnaryLog
+	UnaryGELU      = backend.UnaryGELU
+	UnarySiLU      = backend.UnarySiLU
+	UnaryGELUExact = backend.UnaryGELUExact
 )
 
 // DispatchPolicy controls when elementwise tensor ops are routed to a backend

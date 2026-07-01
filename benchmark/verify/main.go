@@ -137,6 +137,9 @@ func main() {
 			return 0.5 * v * (1 + math.Tanh(0.7978845608028654*(v+0.044715*v*v*v)))
 		}},
 		backend.UnarySiLU: {"silu", func(v float64) float64 { return v / (1 + math.Exp(-v)) }},
+		backend.UnaryGELUExact: {"gelu_exact", func(v float64) float64 {
+			return 0.5 * v * (1 + math.Erf(v/math.Sqrt2))
+		}},
 	}
 	for kind, ref := range unaryRef {
 		got := make([]float64, len(x))
