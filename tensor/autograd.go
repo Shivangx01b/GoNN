@@ -1,9 +1,36 @@
 package tensor
 
+import "sync"
+
 // Reverse-mode automatic differentiation: the Function graph node, the
 // Backward pass (iterative topological sort — safe for arbitrarily deep
 // graphs such as long RNN unrolls), and the MakeNode escape hatch for
 // custom ops.
+
+// leafGradMu serializes gradient accumulation into LEAF tensors (creator ==
+// nil) so that concurrent Backward() calls from multiple goroutines are safe
+// when their graphs share leaves — the data-parallel training case, where
+// every worker builds its own forward graph over the same parameter tensors.
+//
+// Why only leaves need the lock: every op that attaches a creator allocates
+// its output tensor fresh (Zeros/New inside binOp, Sum, MatMul, ...), so a
+// tensor with creator != nil belongs to exactly the graph built by the
+// goroutine that ran the op. Two concurrently built graphs can therefore only
+// share tensors that existed before the forward passes started — and in the
+// supported pattern (each goroutine builds its whole graph from shared
+// parameters) those are precisely the leaves. Interior nodes are graph-local,
+// so their read-modify-write of Grad is single-goroutine and needs no lock.
+//
+// NOT supported (and not synchronized): sharing a non-leaf tensor — an
+// intermediate from a previously built graph — as an input of two graphs that
+// Backward concurrently. Build each graph entirely inside its goroutine.
+//
+// Single-threaded overhead: the lock is taken only on the leaf path, i.e.
+// O(#leaf references) times per Backward, not once per node input. An
+// uncontended sync.Mutex lock/unlock is ~20ns, while accumulating a real
+// parameter's gradient is O(numel) float work — negligible in practice and
+// zero cost on the (far more numerous) interior-node accumulations.
+var leafGradMu sync.Mutex
 
 // Function records the op that produced a tensor and how to backprop.
 type Function struct {
@@ -15,6 +42,13 @@ type Function struct {
 
 // Backward computes gradients by walking the autograd DAG in reverse.
 // t must be a scalar (or you must call .Sum() first).
+//
+// Concurrency: Backward may be called from multiple goroutines at the same
+// time as long as (a) each goroutine built its own graph — from shared leaf
+// tensors is fine, that's data parallelism — and (b) no two calls share a
+// root or interior node. Gradient accumulation into shared LEAVES is
+// serialized by leafGradMu, so concurrent contributions sum exactly like
+// sequential ones (up to float addition order).
 func (t *Tensor) Backward() {
 	if len(t.Data) != 1 {
 		opError("Backward", "can only call on scalar tensors; use t.Sum().Backward()")
@@ -47,14 +81,33 @@ func (t *Tensor) Backward() {
 			g := grads[j]
 			// Sum-reduce gradient back to p's shape if broadcasting expanded it.
 			g = unbroadcast(g, p.Shape)
-			if p.Grad == nil {
-				p.Grad = g
+			if p.creator == nil {
+				// Leaf: possibly shared with graphs being backwarded by other
+				// goroutines. Serialize the whole read-modify-write — including
+				// the nil check, because two goroutines both observing Grad ==
+				// nil and both assigning would drop one contribution (the
+				// first-allocation race matters as much as the += race).
+				leafGradMu.Lock()
+				accumulateGrad(p, g)
+				leafGradMu.Unlock()
 			} else {
-				for k := range p.Grad.Data {
-					p.Grad.Data[k] += g.Data[k]
-				}
+				// Interior node: graph-local (see leafGradMu doc), no lock.
+				accumulateGrad(p, g)
 			}
 		}
+	}
+}
+
+// accumulateGrad adds g into p.Grad, taking ownership of g on first write
+// (the historical behavior: the first gradient tensor is aliased, later ones
+// are summed element-wise in place).
+func accumulateGrad(p, g *Tensor) {
+	if p.Grad == nil {
+		p.Grad = g
+		return
+	}
+	for k := range p.Grad.Data {
+		p.Grad.Data[k] += g.Data[k]
 	}
 }
 
