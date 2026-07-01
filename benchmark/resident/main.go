@@ -57,6 +57,19 @@ func main() {
 	}
 	backend.Use(b)
 	be := backend.Current()
+	ew, hasEW := be.(backend.Elementwiser)
+	if !hasEW {
+		fmt.Println("CUDA backend lacks Elementwiser capability")
+		os.Exit(1)
+	}
+	relu := func(a []float64) []float64 {
+		out := make([]float64, len(a))
+		if !ew.Unary(backend.UnaryReLU, a, out) {
+			fmt.Println("ReLU dispatch declined")
+			os.Exit(1)
+		}
+		return out
+	}
 
 	// MLP: X(B,D0) -> W1(D0,D1) -> relu -> W2(D1,D2) -> relu -> W3(D2,D3)
 	const B, D0, D1, D2, D3 = 256, 1024, 1024, 1024, 1024
@@ -67,9 +80,9 @@ func main() {
 
 	// --- eager per-call forward (each op copies H2D/D2H) ---
 	eager := func() []float64 {
-		h1 := be.ReLU(be.MatMul(X, W1, B, D0, D1))
-		h2 := be.ReLU(be.MatMul(h1, W2, B, D1, D2))
-		return be.MatMul(h2, W3, B, D2, D3)
+		h1 := relu(be.Gemm(X, W1, 1, B, D0, D1, false, false))
+		h2 := relu(be.Gemm(h1, W2, 1, B, D1, D2, false, false))
+		return be.Gemm(h2, W3, 1, B, D2, D3, false, false)
 	}
 
 	// --- device-resident forward (weights uploaded once, kept on device) ---

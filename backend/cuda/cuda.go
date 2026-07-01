@@ -2,8 +2,9 @@
 // +build cuda
 
 // Package cuda is the CUDA backend, built with `-tags cuda`. It calls into
-// gonn_cuda.cpp/cu via CGO. The native side is built on top of the CUDA
-// runtime + cuBLAS for matmul.
+// gonn_cuda.cu via CGO. The native side is built on the CUDA runtime +
+// cuBLAS (strided-batched GEMM) plus enum-dispatched elementwise kernels and
+// a fused fp64 flash-attention (fwd+bwd).
 package cuda
 
 /*
@@ -15,177 +16,89 @@ package cuda
 import "C"
 
 import (
-	"math"
+	"fmt"
+	"sync"
 	"unsafe"
 
 	"gonn/backend"
 )
 
-type cudaBackend struct{}
-
-func (cudaBackend) Name() backend.Device { return backend.CUDA }
-
-func (cudaBackend) MatMul(a, b []float64, m, k, n int) []float64 {
-	out := make([]float64, m*n)
-	C.gonn_matmul(
-		(*C.double)(unsafe.Pointer(&a[0])),
-		(*C.double)(unsafe.Pointer(&b[0])),
-		(*C.double)(unsafe.Pointer(&out[0])),
-		C.int(m), C.int(k), C.int(n),
-	)
-	return out
+// cudaBackend implements backend.Backend + backend.Elementwiser. The mutex
+// serializes CGO entry: the native side stages host data through a grow-only
+// workspace cache (g_ws in gonn_cuda.cu) that is not reentrant, and cuBLAS
+// handles are not thread-safe across goroutines.
+type cudaBackend struct {
+	mu sync.Mutex
 }
 
-func (cudaBackend) AddElem(a, b []float64) []float64 {
-	out := make([]float64, len(a))
-	C.gonn_add(
-		(*C.double)(unsafe.Pointer(&a[0])),
-		(*C.double)(unsafe.Pointer(&b[0])),
-		(*C.double)(unsafe.Pointer(&out[0])),
-		C.int(len(a)),
-	)
-	return out
-}
+var theBackend = &cudaBackend{}
 
-func (cudaBackend) MulElem(a, b []float64) []float64 {
-	out := make([]float64, len(a))
-	C.gonn_mul(
-		(*C.double)(unsafe.Pointer(&a[0])),
-		(*C.double)(unsafe.Pointer(&b[0])),
-		(*C.double)(unsafe.Pointer(&out[0])),
-		C.int(len(a)),
-	)
-	return out
-}
+func (*cudaBackend) Name() backend.Device { return backend.CUDA }
 
-func (cudaBackend) Synchronize() { C.gonn_sync() }
-
-// Elementwise arithmetic ----------------------------------------------------
-
-func (cudaBackend) Sub(a, b []float64) []float64 {
-	out := make([]float64, len(a))
-	if len(a) == 0 {
+// Gemm computes the row-major batched C = op(A) @ op(B) on the GPU via
+// cublasDgemmStridedBatched. A GPU error here is fatal (panic): unlike the
+// elementwise capability there is no cheap correct fallback at this layer,
+// and silently degrading GEMM would invalidate benchmarks.
+func (cb *cudaBackend) Gemm(a, b []float64, batch, m, k, n int, transA, transB bool) []float64 {
+	out := make([]float64, batch*m*n)
+	if batch == 0 || m == 0 || n == 0 || k == 0 {
 		return out
 	}
-	C.gonn_sub(
+	var ta, tb C.int
+	if transA {
+		ta = 1
+	}
+	if transB {
+		tb = 1
+	}
+	cb.mu.Lock()
+	rc := C.gonn_gemm(
 		(*C.double)(unsafe.Pointer(&a[0])),
 		(*C.double)(unsafe.Pointer(&b[0])),
 		(*C.double)(unsafe.Pointer(&out[0])),
-		C.int(len(a)),
+		C.int(batch), C.int(m), C.int(k), C.int(n), ta, tb,
 	)
+	cb.mu.Unlock()
+	if rc != 0 {
+		panic(fmt.Sprintf("cuda: gonn_gemm failed with code %d", int(rc)))
+	}
 	return out
 }
 
-func (cudaBackend) Div(a, b []float64) []float64 {
-	out := make([]float64, len(a))
+func (*cudaBackend) Synchronize() { C.gonn_sync() }
+
+// Unary implements backend.Elementwiser. Returns false (declining the call,
+// so the caller falls back to the CPU loop) on any GPU error.
+func (cb *cudaBackend) Unary(kind backend.UnaryKind, a, out []float64) bool {
 	if len(a) == 0 {
-		return out
+		return true
 	}
-	C.gonn_div(
+	cb.mu.Lock()
+	rc := C.gonn_unary(
+		C.int(kind),
+		(*C.double)(unsafe.Pointer(&a[0])),
+		(*C.double)(unsafe.Pointer(&out[0])),
+		C.long(len(a)),
+	)
+	cb.mu.Unlock()
+	return rc == 0
+}
+
+// Binary implements backend.Elementwiser.
+func (cb *cudaBackend) Binary(kind backend.BinaryKind, a, b, out []float64) bool {
+	if len(a) == 0 {
+		return true
+	}
+	cb.mu.Lock()
+	rc := C.gonn_binary(
+		C.int(kind),
 		(*C.double)(unsafe.Pointer(&a[0])),
 		(*C.double)(unsafe.Pointer(&b[0])),
 		(*C.double)(unsafe.Pointer(&out[0])),
-		C.int(len(a)),
+		C.long(len(a)),
 	)
-	return out
-}
-
-func (cudaBackend) Scale(a []float64, s float64) []float64 {
-	out := make([]float64, len(a))
-	if len(a) == 0 {
-		return out
-	}
-	C.gonn_scale(
-		(*C.double)(unsafe.Pointer(&a[0])),
-		C.double(s),
-		(*C.double)(unsafe.Pointer(&out[0])),
-		C.int(len(a)),
-	)
-	return out
-}
-
-func (cudaBackend) AxpyInto(out, x []float64, alpha float64) {
-	if len(out) == 0 {
-		return
-	}
-	C.gonn_axpy(
-		(*C.double)(unsafe.Pointer(&out[0])),
-		(*C.double)(unsafe.Pointer(&x[0])),
-		C.double(alpha),
-		C.int(len(out)),
-	)
-}
-
-// Reductions ---------------------------------------------------------------
-
-func (cudaBackend) Sum(a []float64) float64 {
-	if len(a) == 0 {
-		return 0
-	}
-	var s C.double
-	C.gonn_sum(
-		(*C.double)(unsafe.Pointer(&a[0])),
-		&s,
-		C.int(len(a)),
-	)
-	return float64(s)
-}
-
-func (cudaBackend) Max(a []float64) float64 {
-	if len(a) == 0 {
-		// Match cpuBackend semantics (-Inf for empty).
-		return math.Inf(-1)
-	}
-	var m C.double
-	C.gonn_max(
-		(*C.double)(unsafe.Pointer(&a[0])),
-		&m,
-		C.int(len(a)),
-	)
-	return float64(m)
-}
-
-// Activations / unary math -------------------------------------------------
-
-func unary(a []float64, fn func(in, out *C.double, n C.int)) []float64 {
-	out := make([]float64, len(a))
-	if len(a) == 0 {
-		return out
-	}
-	fn(
-		(*C.double)(unsafe.Pointer(&a[0])),
-		(*C.double)(unsafe.Pointer(&out[0])),
-		C.int(len(a)),
-	)
-	return out
-}
-
-func (cudaBackend) ReLU(a []float64) []float64 {
-	return unary(a, func(in, out *C.double, n C.int) { C.gonn_relu(in, out, n) })
-}
-
-func (cudaBackend) Sigmoid(a []float64) []float64 {
-	return unary(a, func(in, out *C.double, n C.int) { C.gonn_sigmoid(in, out, n) })
-}
-
-func (cudaBackend) Tanh(a []float64) []float64 {
-	return unary(a, func(in, out *C.double, n C.int) { C.gonn_tanh(in, out, n) })
-}
-
-func (cudaBackend) Exp(a []float64) []float64 {
-	return unary(a, func(in, out *C.double, n C.int) { C.gonn_exp(in, out, n) })
-}
-
-func (cudaBackend) Log(a []float64) []float64 {
-	return unary(a, func(in, out *C.double, n C.int) { C.gonn_log(in, out, n) })
-}
-
-func (cudaBackend) GELU(a []float64) []float64 {
-	return unary(a, func(in, out *C.double, n C.int) { C.gonn_gelu(in, out, n) })
-}
-
-func (cudaBackend) SiLU(a []float64) []float64 {
-	return unary(a, func(in, out *C.double, n C.int) { C.gonn_silu(in, out, n) })
+	cb.mu.Unlock()
+	return rc == 0
 }
 
 // BenchMatMulDev runs a device-resident GEMM benchmark (inputs allocated once
@@ -369,7 +282,7 @@ func BenchMatMulF16Dev(m, k, n, iters int) float64 {
 }
 
 // Backend returns the live CUDA backend.
-func Backend() (backend.Backend, error) { return cudaBackend{}, nil }
+func Backend() (backend.Backend, error) { return theBackend, nil }
 
 // Available reports whether CUDA was compiled in.
 func Available() bool { return true }

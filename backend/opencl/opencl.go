@@ -20,122 +20,82 @@ import "C"
 
 import (
 	"errors"
-	"math"
+	"fmt"
+	"sync"
 	"unsafe"
 
 	"gonn/backend"
 )
 
-type openclBackend struct{}
+// openclBackend implements backend.Backend + backend.Elementwiser. The mutex
+// serializes CGO entry: the native side caches kernel objects per op kind,
+// which is not thread-safe.
+type openclBackend struct {
+	mu sync.Mutex
+}
 
-func (openclBackend) Name() backend.Device { return backend.OpenCL }
+var theBackend = &openclBackend{}
+
+func (*openclBackend) Name() backend.Device { return backend.OpenCL }
 
 func cptr(s []float64) *C.double { return (*C.double)(unsafe.Pointer(&s[0])) }
 
-func (openclBackend) MatMul(a, b []float64, m, k, n int) []float64 {
-	out := make([]float64, m*n)
-	if m == 0 || n == 0 {
+// Gemm computes the row-major batched C = op(A) @ op(B) via the gemmk kernel
+// (naive 3D NDRange — correctness-first; OpenCL is the portability path).
+// A GPU error here is fatal, matching the CUDA backend's contract.
+func (ob *openclBackend) Gemm(a, b []float64, batch, m, k, n int, transA, transB bool) []float64 {
+	out := make([]float64, batch*m*n)
+	if batch == 0 || m == 0 || n == 0 || k == 0 {
 		return out
 	}
-	C.gonn_cl_matmul(cptr(a), cptr(b), cptr(out), C.int(m), C.int(k), C.int(n))
+	var ta, tb C.int
+	if transA {
+		ta = 1
+	}
+	if transB {
+		tb = 1
+	}
+	ob.mu.Lock()
+	rc := C.gonn_cl_gemm(cptr(a), cptr(b), cptr(out),
+		C.int(batch), C.int(m), C.int(k), C.int(n), ta, tb)
+	ob.mu.Unlock()
+	if rc != 0 {
+		panic(fmt.Sprintf("opencl: gonn_cl_gemm failed with code %d", int(rc)))
+	}
 	return out
 }
 
-func binary(a, b []float64, fn func(a, b, c *C.double, n C.int)) []float64 {
-	out := make([]float64, len(a))
+func (*openclBackend) Synchronize() { C.gonn_cl_sync() }
+
+// Unary implements backend.Elementwiser. Returns false (declining the call,
+// so the caller falls back to the CPU loop) on any device error.
+func (ob *openclBackend) Unary(kind backend.UnaryKind, a, out []float64) bool {
 	if len(a) == 0 {
-		return out
+		return true
 	}
-	fn(cptr(a), cptr(b), cptr(out), C.int(len(a)))
-	return out
+	ob.mu.Lock()
+	rc := C.gonn_cl_unary(C.int(kind), cptr(a), cptr(out), C.int(len(a)))
+	ob.mu.Unlock()
+	return rc == 0
 }
 
-func (openclBackend) AddElem(a, b []float64) []float64 {
-	return binary(a, b, func(a, b, c *C.double, n C.int) { C.gonn_cl_add(a, b, c, n) })
-}
-func (openclBackend) MulElem(a, b []float64) []float64 {
-	return binary(a, b, func(a, b, c *C.double, n C.int) { C.gonn_cl_mul(a, b, c, n) })
-}
-func (openclBackend) Sub(a, b []float64) []float64 {
-	return binary(a, b, func(a, b, c *C.double, n C.int) { C.gonn_cl_sub(a, b, c, n) })
-}
-func (openclBackend) Div(a, b []float64) []float64 {
-	return binary(a, b, func(a, b, c *C.double, n C.int) { C.gonn_cl_div(a, b, c, n) })
-}
-
-func (openclBackend) Scale(a []float64, s float64) []float64 {
-	out := make([]float64, len(a))
+// Binary implements backend.Elementwiser.
+func (ob *openclBackend) Binary(kind backend.BinaryKind, a, b, out []float64) bool {
 	if len(a) == 0 {
-		return out
+		return true
 	}
-	C.gonn_cl_scale(cptr(a), C.double(s), cptr(out), C.int(len(a)))
-	return out
+	ob.mu.Lock()
+	rc := C.gonn_cl_binary(C.int(kind), cptr(a), cptr(b), cptr(out), C.int(len(a)))
+	ob.mu.Unlock()
+	return rc == 0
 }
 
-func (openclBackend) AxpyInto(out, x []float64, alpha float64) {
-	if len(out) == 0 {
-		return
-	}
-	C.gonn_cl_axpy(cptr(out), cptr(x), C.double(alpha), C.int(len(out)))
-}
-
-func (openclBackend) Sum(a []float64) float64 {
-	if len(a) == 0 {
-		return 0
-	}
-	var s C.double
-	C.gonn_cl_sum(cptr(a), &s, C.int(len(a)))
-	return float64(s)
-}
-
-func (openclBackend) Max(a []float64) float64 {
-	if len(a) == 0 {
-		return math.Inf(-1)
-	}
-	var m C.double
-	C.gonn_cl_max(cptr(a), &m, C.int(len(a)))
-	return float64(m)
-}
-
-func unary(a []float64, fn func(a, c *C.double, n C.int)) []float64 {
-	out := make([]float64, len(a))
-	if len(a) == 0 {
-		return out
-	}
-	fn(cptr(a), cptr(out), C.int(len(a)))
-	return out
-}
-
-func (openclBackend) ReLU(a []float64) []float64 {
-	return unary(a, func(a, c *C.double, n C.int) { C.gonn_cl_relu(a, c, n) })
-}
-func (openclBackend) Sigmoid(a []float64) []float64 {
-	return unary(a, func(a, c *C.double, n C.int) { C.gonn_cl_sigmoid(a, c, n) })
-}
-func (openclBackend) Tanh(a []float64) []float64 {
-	return unary(a, func(a, c *C.double, n C.int) { C.gonn_cl_tanh(a, c, n) })
-}
-func (openclBackend) Exp(a []float64) []float64 {
-	return unary(a, func(a, c *C.double, n C.int) { C.gonn_cl_exp(a, c, n) })
-}
-func (openclBackend) Log(a []float64) []float64 {
-	return unary(a, func(a, c *C.double, n C.int) { C.gonn_cl_log(a, c, n) })
-}
-func (openclBackend) GELU(a []float64) []float64 {
-	return unary(a, func(a, c *C.double, n C.int) { C.gonn_cl_gelu(a, c, n) })
-}
-func (openclBackend) SiLU(a []float64) []float64 {
-	return unary(a, func(a, c *C.double, n C.int) { C.gonn_cl_silu(a, c, n) })
-}
-
-func (openclBackend) Synchronize() { C.gonn_cl_sync() }
-
-// Backend returns the OpenCL backend if a GPU device with fp64 is available.
+// Backend returns the OpenCL backend if a device with fp64 is available.
 func Backend() (backend.Backend, error) {
 	if C.gonn_cl_available() == 0 {
-		return nil, errors.New("opencl: no usable OpenCL GPU device (fp64) found")
+		return nil, errors.New("opencl: no usable OpenCL device (fp64) found")
 	}
-	return openclBackend{}, nil
+	return theBackend, nil
 }
 
 // Available reports whether the OpenCL backend is compiled in and usable.

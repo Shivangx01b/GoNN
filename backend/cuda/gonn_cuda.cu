@@ -9,6 +9,18 @@
 // Then run Go with: go build -tags cuda
 //
 // The C interface (declared in gonn_cuda.h) is consumed by cuda.go via CGO.
+//
+// Layout:
+//   1. Elementwise kernels, macro-generated (DEF_UNOP / DEF_BINOP). Adding an
+//      op = one DEF_* line + one switch case + one enum value in the header
+//      (mirrored in backend/backend.go).
+//   2. gonn_gemm / gonn_unary / gonn_binary — the eager host-pointer entry
+//      points used by the Go backend. They stage through a grow-only device
+//      workspace cache (g_ws) instead of cudaMalloc/Free per call; the Go
+//      side serializes entry with a mutex, so the cache needs no locking.
+//   3. Fused flash-attention (fwd + bwd) and the device-resident buffer / f16
+//      tensor-core / benchmark sections — unchanged from the verified
+//      implementation (fwd/bwd gradcheck ~5e-8 on an RTX 3060).
 
 #include "gonn_cuda.h"
 #include <cuda_runtime.h>
@@ -23,289 +35,206 @@ static void ensure_handle() {
 }
 
 // ---------------------------------------------------------------------------
-// Elementwise kernels
+// Error handling + launch configuration
 // ---------------------------------------------------------------------------
 
-__global__ void add_kernel(const double* A, const double* B, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) C[i] = A[i] + B[i];
-}
+#define GONN_THREADS 256
 
-__global__ void mul_kernel(const double* A, const double* B, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) C[i] = A[i] * B[i];
-}
+// Evaluate a CUDA runtime call; on failure print and return its error code.
+#define GONN_CHECK(call)                                                     \
+    do {                                                                     \
+        cudaError_t err_ = (call);                                           \
+        if (err_ != cudaSuccess) {                                           \
+            fprintf(stderr, "gonn_cuda: %s: %s\n", #call,                    \
+                    cudaGetErrorString(err_));                               \
+            return (int)err_;                                                \
+        }                                                                    \
+    } while (0)
 
-__global__ void sub_kernel(const double* A, const double* B, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) C[i] = A[i] - B[i];
-}
+// Evaluate a cuBLAS call; on failure print and return its status code.
+#define GONN_CHECK_CUBLAS(call)                                              \
+    do {                                                                     \
+        cublasStatus_t st_ = (call);                                         \
+        if (st_ != CUBLAS_STATUS_SUCCESS) {                                  \
+            fprintf(stderr, "gonn_cuda: %s: cublas status %d\n", #call,      \
+                    (int)st_);                                               \
+            return (int)st_;                                                 \
+        }                                                                    \
+    } while (0)
 
-__global__ void div_kernel(const double* A, const double* B, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) C[i] = A[i] / B[i];
-}
+// Check the last kernel launch.
+#define GONN_CHECK_LAUNCH(what)                                              \
+    do {                                                                     \
+        cudaError_t err_ = cudaGetLastError();                               \
+        if (err_ != cudaSuccess) {                                           \
+            fprintf(stderr, "gonn_cuda: launch %s: %s\n", what,              \
+                    cudaGetErrorString(err_));                               \
+            return (int)err_;                                                \
+        }                                                                    \
+    } while (0)
 
-__global__ void scale_kernel(const double* A, double s, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) C[i] = A[i] * s;
-}
+// ---------------------------------------------------------------------------
+// Elementwise kernels (macro-generated). Long indices so >2^31-element
+// tensors do not overflow. Expressions are kept identical to the historical
+// hand-written kernels — numerics unchanged.
+// ---------------------------------------------------------------------------
 
-__global__ void axpy_kernel(double* OUT, const double* X, double alpha, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) OUT[i] += alpha * X[i];
+#define DEF_UNOP(NAME, EXPR)                                                 \
+    __global__ void NAME##_kernel(const double* A, double* C, long n) {      \
+        long i = blockIdx.x * (long)blockDim.x + threadIdx.x;                \
+        if (i < n) { double x = A[i]; C[i] = (EXPR); }                       \
+    }
+
+#define DEF_BINOP(NAME, EXPR)                                                \
+    __global__ void NAME##_kernel(const double* A, const double* B,          \
+                                  double* C, long n) {                       \
+        long i = blockIdx.x * (long)blockDim.x + threadIdx.x;                \
+        if (i < n) { double a = A[i]; double b = B[i]; C[i] = (EXPR); }      \
+    }
+
+DEF_UNOP(relu,    x > 0.0 ? x : 0.0)
+DEF_UNOP(sigmoid, 1.0 / (1.0 + exp(-x)))
+DEF_UNOP(tanh,    tanh(x))
+DEF_UNOP(exp,     exp(x))
+DEF_UNOP(log,     log(x))
+// GELU, tanh approximation; 0.7978845608028654 = sqrt(2/pi)
+DEF_UNOP(gelu,    0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x))))
+DEF_UNOP(silu,    x / (1.0 + exp(-x)))
+
+DEF_BINOP(add, a + b)
+DEF_BINOP(sub, a - b)
+DEF_BINOP(mul, a * b)
+DEF_BINOP(div, a / b)
+
+// ---------------------------------------------------------------------------
+// Grow-only device workspace cache for the eager host-pointer entry points.
+// Slot 0/1 stage inputs, slot 2 stages the output. NOT reentrant — the Go
+// side (cuda.go) holds a mutex across every gonn_gemm/unary/binary call.
+// ---------------------------------------------------------------------------
+
+static struct { void* p; size_t cap; } g_ws[3];
+
+static int ws_reserve(int slot, size_t bytes) {
+    if (g_ws[slot].cap >= bytes) return 0;
+    if (g_ws[slot].p) cudaFree(g_ws[slot].p);
+    g_ws[slot].p = nullptr;
+    g_ws[slot].cap = 0;
+    cudaError_t err = cudaMalloc(&g_ws[slot].p, bytes);
+    if (err != cudaSuccess) {
+        g_ws[slot].p = nullptr;
+        fprintf(stderr, "gonn_cuda: workspace alloc %zu bytes: %s\n", bytes,
+                cudaGetErrorString(err));
+        return (int)err;
+    }
+    g_ws[slot].cap = bytes;
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
-// Reduction kernels (one-block tree reduce in shared memory).
+// Eager entry points: gonn_gemm / gonn_unary / gonn_binary
+// ---------------------------------------------------------------------------
+
+// Batched row-major GEMM via cublasDgemmStridedBatched.
 //
-// Each thread strides over the input loading + locally combining, then a
-// shared-memory tree reduction collapses the block to a single value.
-// Launched with a single block so the result lives in dOut[0].
-// ---------------------------------------------------------------------------
-
-#define REDUCE_THREADS 256
-
-__global__ void sum_kernel(const double* A, double* out, int n) {
-    __shared__ double sdata[REDUCE_THREADS];
-    int tid = threadIdx.x;
-
-    double acc = 0.0;
-    for (int i = tid; i < n; i += blockDim.x) {
-        acc += A[i];
-    }
-    sdata[tid] = acc;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    if (tid == 0) out[0] = sdata[0];
-}
-
-__global__ void max_kernel(const double* A, double* out, int n) {
-    __shared__ double sdata[REDUCE_THREADS];
-    int tid = threadIdx.x;
-
-    // Sentinel for "empty" lane.
-    double acc = -CUDART_INF;
-    for (int i = tid; i < n; i += blockDim.x) {
-        double v = A[i];
-        if (v > acc) acc = v;
-    }
-    sdata[tid] = acc;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            double other = sdata[tid + s];
-            if (other > sdata[tid]) sdata[tid] = other;
-        }
-        __syncthreads();
-    }
-    if (tid == 0) out[0] = sdata[0];
-}
-
-// ---------------------------------------------------------------------------
-// Activation kernels
-// ---------------------------------------------------------------------------
-
-__global__ void relu_kernel(const double* A, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        double v = A[i];
-        C[i] = v > 0.0 ? v : 0.0;
-    }
-}
-
-__global__ void sigmoid_kernel(const double* A, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) C[i] = 1.0 / (1.0 + exp(-A[i]));
-}
-
-__global__ void tanh_kernel(const double* A, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) C[i] = tanh(A[i]);
-}
-
-__global__ void exp_kernel(const double* A, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) C[i] = exp(A[i]);
-}
-
-__global__ void log_kernel(const double* A, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) C[i] = log(A[i]);
-}
-
-__global__ void gelu_kernel(const double* A, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        // sqrt(2/pi)
-        const double k = 0.7978845608028654;
-        double x = A[i];
-        double inner = k * (x + 0.044715 * x * x * x);
-        C[i] = 0.5 * x * (1.0 + tanh(inner));
-    }
-}
-
-__global__ void silu_kernel(const double* A, double* C, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        double x = A[i];
-        C[i] = x / (1.0 + exp(-x));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// C wrappers — allocate, copy in, launch, copy back, free.
-// Follow the same simple pattern as the existing add/mul/matmul wrappers.
-// ---------------------------------------------------------------------------
-
-extern "C" void gonn_matmul(const double* A, const double* B, double* C, int m, int k, int n) {
+// cuBLAS is column-major, so we compute C^T = op(B)^T * op(A)^T: the
+// column-major (n,m) result written to dC is exactly the row-major (m,n) C.
+// A row-major stored matrix IS its transpose viewed column-major, hence:
+//   transX == false -> the column-major view already provides op(X)^T -> OP_N
+//   transX == true  -> take the column-major transpose               -> OP_T
+// Leading dims are the stored row-major column counts.
+extern "C" int gonn_gemm(const double* A, const double* B, double* C,
+                         int batch, int m, int k, int n, int transA, int transB) {
     ensure_handle();
-    double *dA, *dB, *dC;
-    cudaMalloc(&dA, sizeof(double) * m * k);
-    cudaMalloc(&dB, sizeof(double) * k * n);
-    cudaMalloc(&dC, sizeof(double) * m * n);
-    cudaMemcpy(dA, A, sizeof(double) * m * k, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B, sizeof(double) * k * n, cudaMemcpyHostToDevice);
+    size_t an = (size_t)batch * m * k, bn = (size_t)batch * k * n, cn = (size_t)batch * m * n;
+    int rc;
+    if ((rc = ws_reserve(0, an * sizeof(double))) != 0) return rc;
+    if ((rc = ws_reserve(1, bn * sizeof(double))) != 0) return rc;
+    if ((rc = ws_reserve(2, cn * sizeof(double))) != 0) return rc;
+    double* dA = (double*)g_ws[0].p;
+    double* dB = (double*)g_ws[1].p;
+    double* dC = (double*)g_ws[2].p;
+    GONN_CHECK(cudaMemcpy(dA, A, an * sizeof(double), cudaMemcpyHostToDevice));
+    GONN_CHECK(cudaMemcpy(dB, B, bn * sizeof(double), cudaMemcpyHostToDevice));
 
-    // cuBLAS is column-major. To compute C = A*B (row-major) we compute
-    // C^T = B^T * A^T, then cuBLAS's output is C in row-major layout.
     const double alpha = 1.0, beta = 0.0;
-    cublasDgemm(g_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                n, m, k,
-                &alpha, dB, n, dA, k,
-                &beta, dC, n);
+    cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+    int lda = transA ? m : k; // stored row-major col count of A
+    int ldb = transB ? k : n; // stored row-major col count of B
+    GONN_CHECK_CUBLAS(cublasDgemmStridedBatched(
+        g_handle, opB, opA, n, m, k,
+        &alpha,
+        dB, ldb, (long long)k * n,
+        dA, lda, (long long)m * k,
+        &beta,
+        dC, n, (long long)m * n,
+        batch));
 
-    cudaMemcpy(C, dC, sizeof(double) * m * n, cudaMemcpyDeviceToHost);
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    GONN_CHECK(cudaMemcpy(C, dC, cn * sizeof(double), cudaMemcpyDeviceToHost));
+    return 0;
 }
 
-extern "C" void gonn_add(const double* A, const double* B, double* C, int n) {
-    double *dA, *dB, *dC;
-    cudaMalloc(&dA, sizeof(double) * n);
-    cudaMalloc(&dB, sizeof(double) * n);
-    cudaMalloc(&dC, sizeof(double) * n);
-    cudaMemcpy(dA, A, sizeof(double) * n, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B, sizeof(double) * n, cudaMemcpyHostToDevice);
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    add_kernel<<<blocks, threads>>>(dA, dB, dC, n);
-    cudaMemcpy(C, dC, sizeof(double) * n, cudaMemcpyDeviceToHost);
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
-}
-
-extern "C" void gonn_mul(const double* A, const double* B, double* C, int n) {
-    double *dA, *dB, *dC;
-    cudaMalloc(&dA, sizeof(double) * n);
-    cudaMalloc(&dB, sizeof(double) * n);
-    cudaMalloc(&dC, sizeof(double) * n);
-    cudaMemcpy(dA, A, sizeof(double) * n, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B, sizeof(double) * n, cudaMemcpyHostToDevice);
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    mul_kernel<<<blocks, threads>>>(dA, dB, dC, n);
-    cudaMemcpy(C, dC, sizeof(double) * n, cudaMemcpyDeviceToHost);
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
-}
-
-extern "C" void gonn_sub(const double* A, const double* B, double* C, int n) {
-    double *dA, *dB, *dC;
-    cudaMalloc(&dA, sizeof(double) * n);
-    cudaMalloc(&dB, sizeof(double) * n);
-    cudaMalloc(&dC, sizeof(double) * n);
-    cudaMemcpy(dA, A, sizeof(double) * n, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B, sizeof(double) * n, cudaMemcpyHostToDevice);
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    sub_kernel<<<blocks, threads>>>(dA, dB, dC, n);
-    cudaMemcpy(C, dC, sizeof(double) * n, cudaMemcpyDeviceToHost);
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
-}
-
-extern "C" void gonn_div(const double* A, const double* B, double* C, int n) {
-    double *dA, *dB, *dC;
-    cudaMalloc(&dA, sizeof(double) * n);
-    cudaMalloc(&dB, sizeof(double) * n);
-    cudaMalloc(&dC, sizeof(double) * n);
-    cudaMemcpy(dA, A, sizeof(double) * n, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B, sizeof(double) * n, cudaMemcpyHostToDevice);
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    div_kernel<<<blocks, threads>>>(dA, dB, dC, n);
-    cudaMemcpy(C, dC, sizeof(double) * n, cudaMemcpyDeviceToHost);
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
-}
-
-extern "C" void gonn_scale(const double* A, double s, double* C, int n) {
-    double *dA, *dC;
-    cudaMalloc(&dA, sizeof(double) * n);
-    cudaMalloc(&dC, sizeof(double) * n);
-    cudaMemcpy(dA, A, sizeof(double) * n, cudaMemcpyHostToDevice);
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    scale_kernel<<<blocks, threads>>>(dA, s, dC, n);
-    cudaMemcpy(C, dC, sizeof(double) * n, cudaMemcpyDeviceToHost);
-    cudaFree(dA); cudaFree(dC);
-}
-
-extern "C" void gonn_axpy(double* OUT, const double* X, double alpha, int n) {
-    double *dOut, *dX;
-    cudaMalloc(&dOut, sizeof(double) * n);
-    cudaMalloc(&dX, sizeof(double) * n);
-    cudaMemcpy(dOut, OUT, sizeof(double) * n, cudaMemcpyHostToDevice);
-    cudaMemcpy(dX, X, sizeof(double) * n, cudaMemcpyHostToDevice);
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    axpy_kernel<<<blocks, threads>>>(dOut, dX, alpha, n);
-    cudaMemcpy(OUT, dOut, sizeof(double) * n, cudaMemcpyDeviceToHost);
-    cudaFree(dOut); cudaFree(dX);
-}
-
-extern "C" void gonn_sum(const double* A, double* out_scalar, int n) {
-    double *dA, *dOut;
-    cudaMalloc(&dA, sizeof(double) * n);
-    cudaMalloc(&dOut, sizeof(double));
-    cudaMemcpy(dA, A, sizeof(double) * n, cudaMemcpyHostToDevice);
-    sum_kernel<<<1, REDUCE_THREADS>>>(dA, dOut, n);
-    cudaMemcpy(out_scalar, dOut, sizeof(double), cudaMemcpyDeviceToHost);
-    cudaFree(dA); cudaFree(dOut);
-}
-
-extern "C" void gonn_max(const double* A, double* out_scalar, int n) {
-    double *dA, *dOut;
-    cudaMalloc(&dA, sizeof(double) * n);
-    cudaMalloc(&dOut, sizeof(double));
-    cudaMemcpy(dA, A, sizeof(double) * n, cudaMemcpyHostToDevice);
-    max_kernel<<<1, REDUCE_THREADS>>>(dA, dOut, n);
-    cudaMemcpy(out_scalar, dOut, sizeof(double), cudaMemcpyDeviceToHost);
-    cudaFree(dA); cudaFree(dOut);
-}
-
-// Generic unary launcher macro: copies A in, launches KERNEL, copies C out.
-#define GONN_UNARY(NAME, KERNEL)                                           \
-    extern "C" void NAME(const double* A, double* C, int n) {              \
-        double *dA, *dC;                                                   \
-        cudaMalloc(&dA, sizeof(double) * n);                               \
-        cudaMalloc(&dC, sizeof(double) * n);                               \
-        cudaMemcpy(dA, A, sizeof(double) * n, cudaMemcpyHostToDevice);     \
-        int threads = 256;                                                 \
-        int blocks = (n + threads - 1) / threads;                          \
-        KERNEL<<<blocks, threads>>>(dA, dC, n);                            \
-        cudaMemcpy(C, dC, sizeof(double) * n, cudaMemcpyDeviceToHost);     \
-        cudaFree(dA); cudaFree(dC);                                        \
+static int launch_unary(int kind, const double* dA, double* dC, long n) {
+    int blocks = (int)((n + GONN_THREADS - 1) / GONN_THREADS);
+    switch (kind) {
+    case GONN_UN_RELU:    relu_kernel<<<blocks, GONN_THREADS>>>(dA, dC, n); break;
+    case GONN_UN_SIGMOID: sigmoid_kernel<<<blocks, GONN_THREADS>>>(dA, dC, n); break;
+    case GONN_UN_TANH:    tanh_kernel<<<blocks, GONN_THREADS>>>(dA, dC, n); break;
+    case GONN_UN_EXP:     exp_kernel<<<blocks, GONN_THREADS>>>(dA, dC, n); break;
+    case GONN_UN_LOG:     log_kernel<<<blocks, GONN_THREADS>>>(dA, dC, n); break;
+    case GONN_UN_GELU:    gelu_kernel<<<blocks, GONN_THREADS>>>(dA, dC, n); break;
+    case GONN_UN_SILU:    silu_kernel<<<blocks, GONN_THREADS>>>(dA, dC, n); break;
+    default:
+        fprintf(stderr, "gonn_cuda: unknown unary kind %d\n", kind);
+        return -1;
     }
+    GONN_CHECK_LAUNCH("unary");
+    return 0;
+}
 
-GONN_UNARY(gonn_relu,    relu_kernel)
-GONN_UNARY(gonn_sigmoid, sigmoid_kernel)
-GONN_UNARY(gonn_tanh,    tanh_kernel)
-GONN_UNARY(gonn_exp,     exp_kernel)
-GONN_UNARY(gonn_log,     log_kernel)
-GONN_UNARY(gonn_gelu,    gelu_kernel)
-GONN_UNARY(gonn_silu,    silu_kernel)
+static int launch_binary(int kind, const double* dA, const double* dB, double* dC, long n) {
+    int blocks = (int)((n + GONN_THREADS - 1) / GONN_THREADS);
+    switch (kind) {
+    case GONN_BIN_ADD: add_kernel<<<blocks, GONN_THREADS>>>(dA, dB, dC, n); break;
+    case GONN_BIN_SUB: sub_kernel<<<blocks, GONN_THREADS>>>(dA, dB, dC, n); break;
+    case GONN_BIN_MUL: mul_kernel<<<blocks, GONN_THREADS>>>(dA, dB, dC, n); break;
+    case GONN_BIN_DIV: div_kernel<<<blocks, GONN_THREADS>>>(dA, dB, dC, n); break;
+    default:
+        fprintf(stderr, "gonn_cuda: unknown binary kind %d\n", kind);
+        return -1;
+    }
+    GONN_CHECK_LAUNCH("binary");
+    return 0;
+}
+
+extern "C" int gonn_unary(int kind, const double* A, double* C, long n) {
+    if (n <= 0) return 0;
+    int rc;
+    if ((rc = ws_reserve(0, (size_t)n * sizeof(double))) != 0) return rc;
+    if ((rc = ws_reserve(2, (size_t)n * sizeof(double))) != 0) return rc;
+    double* dA = (double*)g_ws[0].p;
+    double* dC = (double*)g_ws[2].p;
+    GONN_CHECK(cudaMemcpy(dA, A, (size_t)n * sizeof(double), cudaMemcpyHostToDevice));
+    if ((rc = launch_unary(kind, dA, dC, n)) != 0) return rc;
+    GONN_CHECK(cudaMemcpy(C, dC, (size_t)n * sizeof(double), cudaMemcpyDeviceToHost));
+    return 0;
+}
+
+extern "C" int gonn_binary(int kind, const double* A, const double* B, double* C, long n) {
+    if (n <= 0) return 0;
+    int rc;
+    if ((rc = ws_reserve(0, (size_t)n * sizeof(double))) != 0) return rc;
+    if ((rc = ws_reserve(1, (size_t)n * sizeof(double))) != 0) return rc;
+    if ((rc = ws_reserve(2, (size_t)n * sizeof(double))) != 0) return rc;
+    double* dA = (double*)g_ws[0].p;
+    double* dB = (double*)g_ws[1].p;
+    double* dC = (double*)g_ws[2].p;
+    GONN_CHECK(cudaMemcpy(dA, A, (size_t)n * sizeof(double), cudaMemcpyHostToDevice));
+    GONN_CHECK(cudaMemcpy(dB, B, (size_t)n * sizeof(double), cudaMemcpyHostToDevice));
+    if ((rc = launch_binary(kind, dA, dB, dC, n)) != 0) return rc;
+    GONN_CHECK(cudaMemcpy(C, dC, (size_t)n * sizeof(double), cudaMemcpyDeviceToHost));
+    return 0;
+}
 
 extern "C" void gonn_sync() { cudaDeviceSynchronize(); }
 
@@ -333,7 +262,7 @@ extern "C" double gonn_bench_matmul_dev(int m, int k, int n, int iters, int f32)
     const float  a32 = 1.0f, b32 = 0.0f;
     const double a64 = 1.0,  b64 = 0.0;
     // cuBLAS is column-major: compute C^T = B^T * A^T so the row-major result
-    // lands in dC (same trick as gonn_matmul).
+    // lands in dC (same trick as gonn_gemm).
     #define GEMM_ONCE()                                                              \
         do {                                                                         \
             if (f32) cublasSgemm(g_handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,        \

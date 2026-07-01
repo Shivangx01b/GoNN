@@ -1,9 +1,10 @@
 //go:build opencl
 // +build opencl
 
-// Correctness check + quick benchmark for the OpenCL backend. Runs ops through
+// Correctness check for the OpenCL backend. Runs ops through
 // backend.Current() (the OpenCL backend) and compares against a pure-Go
-// reference. Exits non-zero on mismatch.
+// reference, including the batched/transposed GEMM paths. Exits non-zero on
+// mismatch.
 //
 //	go run -tags opencl ./benchmark/openclcheck
 package main
@@ -17,13 +18,29 @@ import (
 	"gonn/backend/opencl"
 )
 
-func refMatMul(a, b []float64, m, k, n int) []float64 {
-	out := make([]float64, m*n)
-	for i := 0; i < m; i++ {
-		for kk := 0; kk < k; kk++ {
-			x := a[i*k+kk]
+// refGemm is a naive reference for row-major batched C = op(A) @ op(B).
+func refGemm(a, b []float64, batch, m, k, n int, transA, transB bool) []float64 {
+	out := make([]float64, batch*m*n)
+	at := func(bi, i, j int) float64 {
+		if transA {
+			return a[bi*m*k+j*m+i]
+		}
+		return a[bi*m*k+i*k+j]
+	}
+	bt := func(bi, i, j int) float64 {
+		if transB {
+			return b[bi*k*n+j*k+i]
+		}
+		return b[bi*k*n+i*n+j]
+	}
+	for bi := 0; bi < batch; bi++ {
+		for i := 0; i < m; i++ {
 			for j := 0; j < n; j++ {
-				out[i*n+j] += x * b[kk*n+j]
+				var s float64
+				for p := 0; p < k; p++ {
+					s += at(bi, i, p) * bt(bi, p, j)
+				}
+				out[bi*m*n+i*n+j] = s
 			}
 		}
 	}
@@ -43,9 +60,17 @@ func maxAbsDiff(x, y []float64) float64 {
 func check(name string, got, want []float64, tol float64) bool {
 	d := maxAbsDiff(got, want)
 	ok := d <= tol
-	fmt.Printf("  %-16s maxAbsDiff=%.3e  tol=%.0e  [%s]\n", name, d, tol,
+	fmt.Printf("  %-24s maxAbsDiff=%.3e  tol=%.0e  [%s]\n", name, d, tol,
 		map[bool]string{true: "OK", false: "FAIL"}[ok])
 	return ok
+}
+
+func waveData(n int, freq float64) []float64 {
+	d := make([]float64, n)
+	for i := range d {
+		d[i] = math.Sin(float64(i) * freq)
+	}
+	return d
 }
 
 func main() {
@@ -60,58 +85,77 @@ func main() {
 
 	ok := true
 
+	// ---- GEMM: plain, trans, batched ----------------------------------------
 	m, k, n := 64, 48, 32
-	A := make([]float64, m*k)
-	B := make([]float64, k*n)
-	for i := range A {
-		A[i] = math.Sin(float64(i) * 0.1)
-	}
-	for i := range B {
-		B[i] = math.Cos(float64(i) * 0.07)
-	}
-	ok = check("matmul", be.MatMul(A, B, m, k, n), refMatMul(A, B, m, k, n), 1e-9) && ok
+	A := waveData(m*k, 0.1)
+	B := waveData(k*n, 0.07)
+	ok = check("gemm",
+		be.Gemm(A, B, 1, m, k, n, false, false),
+		refGemm(A, B, 1, m, k, n, false, false), 1e-9) && ok
+	At := waveData(k*m, 0.11)
+	Bt := waveData(n*k, 0.05)
+	ok = check("gemm transA",
+		be.Gemm(At, B, 1, m, k, n, true, false),
+		refGemm(At, B, 1, m, k, n, true, false), 1e-9) && ok
+	ok = check("gemm transB",
+		be.Gemm(A, Bt, 1, m, k, n, false, true),
+		refGemm(A, Bt, 1, m, k, n, false, true), 1e-9) && ok
+	const batch = 3
+	Ab := waveData(batch*m*k, 0.09)
+	Bb := waveData(batch*k*n, 0.06)
+	ok = check("gemm batched",
+		be.Gemm(Ab, Bb, batch, m, k, n, false, false),
+		refGemm(Ab, Bb, batch, m, k, n, false, false), 1e-9) && ok
 
+	// ---- Elementwise capability ---------------------------------------------
+	ew, has := be.(backend.Elementwiser)
+	if !has {
+		fmt.Println("backend does not implement Elementwiser [FAIL]")
+		os.Exit(1)
+	}
 	x := []float64{-2, -0.5, 0, 0.5, 1, 2, 3, -3}
 	y := []float64{1, 2, 3, 4, 5, 6, 7, 8}
-	add := make([]float64, len(x))
-	mul := make([]float64, len(x))
-	sub := make([]float64, len(x))
-	relu := make([]float64, len(x))
-	sig := make([]float64, len(x))
-	for i := range x {
-		add[i] = x[i] + y[i]
-		mul[i] = x[i] * y[i]
-		sub[i] = x[i] - y[i]
-		if x[i] > 0 {
-			relu[i] = x[i]
-		}
-		sig[i] = 1.0 / (1.0 + math.Exp(-x[i]))
-	}
-	ok = check("add", be.AddElem(x, y), add, 1e-12) && ok
-	ok = check("mul", be.MulElem(x, y), mul, 1e-12) && ok
-	ok = check("sub", be.Sub(x, y), sub, 1e-12) && ok
-	ok = check("relu", be.ReLU(x), relu, 1e-12) && ok
-	ok = check("sigmoid", be.Sigmoid(x), sig, 1e-12) && ok
 
-	sum, mx := 0.0, math.Inf(-1)
-	for _, v := range x {
-		sum += v
-		if v > mx {
-			mx = v
+	run1 := func(name string, kind backend.UnaryKind, in []float64, f func(float64) float64, tol float64) {
+		got := make([]float64, len(in))
+		if !ew.Unary(kind, in, got) {
+			fmt.Printf("  %-24s declined [FAIL]\n", name)
+			ok = false
+			return
 		}
+		want := make([]float64, len(in))
+		for i, v := range in {
+			want[i] = f(v)
+		}
+		ok = check(name, got, want, tol) && ok
 	}
-	if d := math.Abs(be.Sum(x) - sum); d > 1e-9 {
-		fmt.Printf("  %-16s diff=%.3e [FAIL]\n", "sum", d)
-		ok = false
-	} else {
-		fmt.Printf("  %-16s diff=%.3e [OK]\n", "sum", d)
+	run1("relu", backend.UnaryReLU, x, func(v float64) float64 { return math.Max(v, 0) }, 1e-12)
+	run1("sigmoid", backend.UnarySigmoid, x, func(v float64) float64 { return 1 / (1 + math.Exp(-v)) }, 1e-12)
+	run1("tanh", backend.UnaryTanh, x, math.Tanh, 1e-12)
+	run1("exp", backend.UnaryExp, x, math.Exp, 1e-12)
+	run1("log", backend.UnaryLog, []float64{0.1, 0.5, 1, 2, 5, 10, 0.01, 3}, math.Log, 1e-12)
+	run1("gelu", backend.UnaryGELU, x, func(v float64) float64 {
+		return 0.5 * v * (1 + math.Tanh(0.7978845608028654*(v+0.044715*v*v*v)))
+	}, 1e-12)
+	run1("silu", backend.UnarySiLU, x, func(v float64) float64 { return v / (1 + math.Exp(-v)) }, 1e-12)
+
+	run2 := func(name string, kind backend.BinaryKind, f func(a, b float64) float64) {
+		got := make([]float64, len(x))
+		if !ew.Binary(kind, x, y, got) {
+			fmt.Printf("  %-24s declined [FAIL]\n", name)
+			ok = false
+			return
+		}
+		want := make([]float64, len(x))
+		for i := range x {
+			want[i] = f(x[i], y[i])
+		}
+		ok = check(name, got, want, 1e-12) && ok
 	}
-	if d := math.Abs(be.Max(x) - mx); d > 1e-12 {
-		fmt.Printf("  %-16s diff=%.3e [FAIL]\n", "max", d)
-		ok = false
-	} else {
-		fmt.Printf("  %-16s diff=%.3e [OK]\n", "max", d)
-	}
+	run2("add", backend.BinaryAdd, func(a, b float64) float64 { return a + b })
+	run2("sub", backend.BinarySub, func(a, b float64) float64 { return a - b })
+	run2("mul", backend.BinaryMul, func(a, b float64) float64 { return a * b })
+	run2("div", backend.BinaryDiv, func(a, b float64) float64 { return a / b })
 
 	if !ok {
 		fmt.Println("OPENCL VERIFY: FAILED")

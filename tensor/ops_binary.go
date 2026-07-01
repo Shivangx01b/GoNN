@@ -1,7 +1,5 @@
 package tensor
 
-import "gonn/backend"
-
 // Binary elementwise ops with broadcasting + autograd.
 
 // Add returns t + o.
@@ -35,22 +33,24 @@ func binOp(a, b *Tensor, op string) *Tensor {
 	outShape := broadcastShapes(a.Shape, b.Shape)
 	ax, bx := expandTo(a, outShape), expandTo(b, outShape)
 	out := Zeros(outShape...)
-	switch op {
-	case "Add":
-		for i := range out.Data {
-			out.Data[i] = ax.Data[i] + bx.Data[i]
-		}
-	case "Sub":
-		for i := range out.Data {
-			out.Data[i] = ax.Data[i] - bx.Data[i]
-		}
-	case "Mul":
-		for i := range out.Data {
-			out.Data[i] = ax.Data[i] * bx.Data[i]
-		}
-	case "Div":
-		for i := range out.Data {
-			out.Data[i] = ax.Data[i] / bx.Data[i]
+	if !dispatchBinary(binaryKindOf(op), ax.Data, bx.Data, out.Data) {
+		switch op {
+		case "Add":
+			for i := range out.Data {
+				out.Data[i] = ax.Data[i] + bx.Data[i]
+			}
+		case "Sub":
+			for i := range out.Data {
+				out.Data[i] = ax.Data[i] - bx.Data[i]
+			}
+		case "Mul":
+			for i := range out.Data {
+				out.Data[i] = ax.Data[i] * bx.Data[i]
+			}
+		case "Div":
+			for i := range out.Data {
+				out.Data[i] = ax.Data[i] / bx.Data[i]
+			}
 		}
 	}
 	finishOp(out, promote(a.Dtype, b.Dtype))
@@ -106,7 +106,7 @@ func (t *Tensor) MatMul(o *Tensor) *Tensor {
 	}
 	// Dispatch the heavy GEMM through the active compute backend (CPU by
 	// default; cuBLAS when built with -tags cuda and a CUDA backend is set).
-	out := New(matmul2D(t.Data, o.Data, m, k, n), m, n)
+	out := New(dispatchGemm(t.Data, o.Data, 1, m, k, n, false, false), m, n)
 	finishOp(out, promote(t.Dtype, o.Dtype))
 	if t.RequiresGrad || o.RequiresGrad || t.creator != nil || o.creator != nil {
 		out.RequiresGrad = true
@@ -115,31 +115,15 @@ func (t *Tensor) MatMul(o *Tensor) *Tensor {
 			Inputs: []*Tensor{t, o},
 			Backward: func(grad *Tensor, _ []interface{}, inputs []*Tensor) []*Tensor {
 				a, b := inputs[0], inputs[1]
-				// dA = grad @ B^T,  dB = A^T @ grad
-				ga := matmul2D(grad.Data, transpose2D(b.Data, b.Shape[0], b.Shape[1]),
-					grad.Shape[0], grad.Shape[1], b.Shape[0])
-				gb := matmul2D(transpose2D(a.Data, a.Shape[0], a.Shape[1]), grad.Data,
-					a.Shape[1], a.Shape[0], grad.Shape[1])
+				// dA = grad @ B^T, dB = A^T @ grad — via GEMM trans flags,
+				// so no explicit transpose copies are materialized.
+				ga := dispatchGemm(grad.Data, b.Data, 1, m, n, k, false, true)
+				gb := dispatchGemm(a.Data, grad.Data, 1, k, m, n, true, false)
 				return []*Tensor{
 					New(ga, a.Shape...),
 					New(gb, b.Shape...),
 				}
 			},
-		}
-	}
-	return out
-}
-
-// matmul2D multiplies row-major A (m×k) by B (k×n) via the active backend.
-func matmul2D(A, B []float64, m, k, n int) []float64 {
-	return backend.Current().MatMul(A, B, m, k, n)
-}
-
-func transpose2D(A []float64, m, n int) []float64 {
-	out := make([]float64, m*n)
-	for i := 0; i < m; i++ {
-		for j := 0; j < n; j++ {
-			out[j*m+i] = A[i*n+j]
 		}
 	}
 	return out

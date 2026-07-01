@@ -7,42 +7,39 @@
 extern "C" {
 #endif
 
-// Matrix multiply (row-major): C(m,n) = A(m,k) * B(k,n)
-void gonn_matmul(const double* A, const double* B, double* C, int m, int k, int n);
+// Elementwise op kinds. These mirror backend.UnaryKind / backend.BinaryKind
+// in Go (backend/backend.go) — the values are a shared ABI. Append only;
+// never reorder or remove.
+enum {
+    GONN_UN_RELU = 0,
+    GONN_UN_SIGMOID,
+    GONN_UN_TANH,
+    GONN_UN_EXP,
+    GONN_UN_LOG,
+    GONN_UN_GELU,   /* tanh approximation */
+    GONN_UN_SILU    /* x * sigmoid(x) */
+};
+enum {
+    GONN_BIN_ADD = 0,
+    GONN_BIN_SUB,
+    GONN_BIN_MUL,
+    GONN_BIN_DIV
+};
 
-// Elementwise add: C[i] = A[i] + B[i]
-void gonn_add(const double* A, const double* B, double* C, int n);
+// All return 0 on success, else a cudaError_t / cublasStatus_t value.
 
-// Elementwise multiply: C[i] = A[i] * B[i]
-void gonn_mul(const double* A, const double* B, double* C, int n);
+// Batched row-major GEMM: for each of `batch` contiguous matrix pairs,
+// C(m,n) = op(A) @ op(B) where op(A) is (m,k) (stored (k,m) when transA)
+// and op(B) is (k,n) (stored (n,k) when transB). batch == 1 is a plain GEMM.
+// Uses cublasDgemmStridedBatched.
+int gonn_gemm(const double* A, const double* B, double* C,
+              int batch, int m, int k, int n, int transA, int transB);
 
-// Elementwise subtract: C[i] = A[i] - B[i]
-void gonn_sub(const double* A, const double* B, double* C, int n);
+// Elementwise unary: C[i] = f_kind(A[i]) for i in [0, n).
+int gonn_unary(int kind, const double* A, double* C, long n);
 
-// Elementwise divide: C[i] = A[i] / B[i]
-void gonn_div(const double* A, const double* B, double* C, int n);
-
-// Scalar multiply: C[i] = A[i] * s
-void gonn_scale(const double* A, double s, double* C, int n);
-
-// In-place axpy: OUT[i] += alpha * X[i]
-// OUT is both an input (current value) and an output (updated value).
-void gonn_axpy(double* OUT, const double* X, double alpha, int n);
-
-// Reductions over n elements; result is a scalar written to *out_scalar.
-void gonn_sum(const double* A, double* out_scalar, int n);
-void gonn_max(const double* A, double* out_scalar, int n);
-
-// Activations: C[i] = f(A[i])
-void gonn_relu(const double* A, double* C, int n);
-void gonn_sigmoid(const double* A, double* C, int n);
-void gonn_tanh(const double* A, double* C, int n);
-void gonn_exp(const double* A, double* C, int n);
-void gonn_log(const double* A, double* C, int n);
-// GELU: tanh approximation.
-void gonn_gelu(const double* A, double* C, int n);
-// SiLU / Swish: x * sigmoid(x).
-void gonn_silu(const double* A, double* C, int n);
+// Elementwise binary: C[i] = A[i] op_kind B[i] for i in [0, n).
+int gonn_binary(int kind, const double* A, const double* B, double* C, long n);
 
 // Block until queued GPU work completes.
 void gonn_sync();

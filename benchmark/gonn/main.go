@@ -4,11 +4,14 @@
 //	CPU:  go run ./benchmark/gonn
 //	CUDA: go run -tags cuda ./benchmark/gonn   (inside the CUDA docker image)
 //
-// Emits benchmark/results/gonn_<device>.json.
+// Emits benchmark/results/gonn_<device>.json. When the backend implements
+// backend.Elementwiser it also prints a per-size CPU-vs-dispatch table used
+// to tune tensor.DispatchPolicy.UnaryMinElems.
 package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"time"
@@ -47,6 +50,20 @@ func randData(n int) []float64 {
 	return d
 }
 
+// addHost / reluHost are the pure-Go reference paths, used when the backend
+// has no Elementwiser capability (CPU) — matching what tensor ops run.
+func addHost(a, b, out []float64) {
+	for i := range a {
+		out[i] = a[i] + b[i]
+	}
+}
+
+func reluHost(a, out []float64) {
+	for i, v := range a {
+		out[i] = math.Max(v, 0)
+	}
+}
+
 func main() {
 	device := "cpu"
 	transfer := "host"
@@ -59,6 +76,7 @@ func main() {
 		fmt.Println("[gonn-bench] CPU backend active")
 	}
 	be := backend.Current()
+	ew, hasEW := be.(backend.Elementwiser)
 
 	var recs []record
 	const warmup = 5
@@ -69,13 +87,13 @@ func main() {
 		B := randData(n * n)
 		iters := 20
 		for i := 0; i < warmup; i++ {
-			_ = be.MatMul(A, B, n, n, n)
+			_ = be.Gemm(A, B, 1, n, n, n, false, false)
 		}
 		be.Synchronize()
 		durs := make([]time.Duration, iters)
 		for i := 0; i < iters; i++ {
 			t0 := time.Now()
-			_ = be.MatMul(A, B, n, n, n)
+			_ = be.Gemm(A, B, 1, n, n, n, false, false)
 			be.Synchronize()
 			durs[i] = time.Since(t0)
 		}
@@ -85,20 +103,32 @@ func main() {
 		fmt.Printf("  matmul N=%-5d  %.3f ms  %.1f GFLOP/s\n", n, ms, gf)
 	}
 
-	// ---- elementwise add & relu ----
+	// ---- elementwise add & relu (dispatched when available, else host) ----
 	for _, m := range []int{1_000_000, 10_000_000} {
 		A := randData(m)
 		B := randData(m)
+		out := make([]float64, m)
 		iters := 50
 
+		addOnce := func() {
+			if !hasEW || !ew.Binary(backend.BinaryAdd, A, B, out) {
+				addHost(A, B, out)
+			}
+		}
+		reluOnce := func() {
+			if !hasEW || !ew.Unary(backend.UnaryReLU, A, out) {
+				reluHost(A, out)
+			}
+		}
+
 		for i := 0; i < warmup; i++ {
-			_ = be.AddElem(A, B)
+			addOnce()
 		}
 		be.Synchronize()
 		durs := make([]time.Duration, iters)
 		for i := 0; i < iters; i++ {
 			t0 := time.Now()
-			_ = be.AddElem(A, B)
+			addOnce()
 			be.Synchronize()
 			durs[i] = time.Since(t0)
 		}
@@ -106,17 +136,47 @@ func main() {
 		fmt.Printf("  add    M=%-9d %.3f ms\n", m, medianMs(durs))
 
 		for i := 0; i < warmup; i++ {
-			_ = be.ReLU(A)
+			reluOnce()
 		}
 		be.Synchronize()
 		for i := 0; i < iters; i++ {
 			t0 := time.Now()
-			_ = be.ReLU(A)
+			reluOnce()
 			be.Synchronize()
 			durs[i] = time.Since(t0)
 		}
 		recs = append(recs, record{"gonn", device, "float64", "relu", m, medianMs(durs), nil, iters, transfer})
 		fmt.Printf("  relu   M=%-9d %.3f ms\n", m, medianMs(durs))
+	}
+
+	// ---- unary dispatch break-even table (GPU backends only) ----
+	// Times the pure-Go loop vs the dispatched kernel (incl. H2D/D2H) for a
+	// transcendental op across sizes, to tune DispatchPolicy.UnaryMinElems.
+	if hasEW {
+		fmt.Println("[gonn-bench] unary dispatch break-even (tanh): size, host ms, dispatch ms")
+		for _, m := range []int{1 << 14, 1 << 16, 1 << 18, 1 << 20, 1 << 22} {
+			A := randData(m)
+			out := make([]float64, m)
+			const it = 20
+
+			hostDurs := make([]time.Duration, it)
+			for i := 0; i < it; i++ {
+				t0 := time.Now()
+				for j, v := range A {
+					out[j] = math.Tanh(v)
+				}
+				hostDurs[i] = time.Since(t0)
+			}
+			devDurs := make([]time.Duration, it)
+			for i := 0; i < it; i++ {
+				t0 := time.Now()
+				ew.Unary(backend.UnaryTanh, A, out)
+				be.Synchronize()
+				devDurs[i] = time.Since(t0)
+			}
+			fmt.Printf("  tanh M=%-9d host %.3f ms   dispatch %.3f ms\n",
+				m, medianMs(hostDurs), medianMs(devDurs))
+		}
 	}
 
 	if err := os.MkdirAll("benchmark/results", 0o755); err != nil {
