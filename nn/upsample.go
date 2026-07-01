@@ -10,13 +10,14 @@ import (
 // matching torch.nn.Upsample for integer scale factors:
 //
 //   - 3D input (N, C, L):        modes "nearest", "linear"
-//   - 4D input (N, C, H, W):     modes "nearest", "bilinear"
+//   - 4D input (N, C, H, W):     modes "nearest", "bilinear", "bicubic"
 //   - 5D input (N, C, D, H, W):  modes "nearest", "trilinear"
 //
-// AlignCorners (default false, like PyTorch) affects only the linear modes:
-// with align_corners=false source coordinates are (dst+0.5)/scale - 0.5 with
-// edge clamping; with align_corners=true they are dst*(in-1)/(out-1), so the
-// corner samples of input and output coincide. Nearest mode ignores it.
+// AlignCorners (default false, like PyTorch) affects only the interpolating
+// modes: with align_corners=false source coordinates are (dst+0.5)/scale -
+// 0.5 with edge clamping; with align_corners=true they are dst*(in-1)/
+// (out-1), so the corner samples of input and output coincide. Nearest mode
+// ignores it.
 //
 // Every mode lowers to a constant gather/weight matrix applied with MatMul,
 // so gradients flow by construction and the layer dispatches to cuBLAS
@@ -31,8 +32,8 @@ type Upsample struct {
 // UpsampleOpt configures an Upsample.
 type UpsampleOpt func(*Upsample)
 
-// WithAlignCorners sets align_corners for the linear interpolation modes
-// ("linear", "bilinear", "trilinear"). Default false (PyTorch parity).
+// WithAlignCorners sets align_corners for the interpolation modes ("linear",
+// "bilinear", "bicubic", "trilinear"). Default false (PyTorch parity).
 func WithAlignCorners(on bool) UpsampleOpt {
 	return func(u *Upsample) { u.AlignCorners = on }
 }
@@ -46,9 +47,9 @@ func NewUpsample(scaleFactor int, mode string, opts ...UpsampleOpt) *Upsample {
 		mode = "nearest"
 	}
 	switch mode {
-	case "nearest", "linear", "bilinear", "trilinear":
+	case "nearest", "linear", "bilinear", "bicubic", "trilinear":
 	default:
-		panic("Upsample: mode must be 'nearest', 'linear', 'bilinear' or 'trilinear'")
+		panic("Upsample: mode must be 'nearest', 'linear', 'bilinear', 'bicubic' or 'trilinear'")
 	}
 	u := &Upsample{ScaleFactor: scaleFactor, Mode: mode}
 	for _, fn := range opts {
@@ -110,6 +111,46 @@ func linWeights(in, out, r int, alignCorners bool) (i0, i1 []int, w []float64) {
 		i1[o] = clampInt(lo+1, 0, in-1)
 	}
 	return i0, i1, w
+}
+
+// cubicKernel evaluates the Keys (1981) cubic convolution kernel with
+// a = -0.75, the coefficient PyTorch uses for its "bicubic" mode:
+//
+//	W(t) = (a+2)|t|^3 - (a+3)|t|^2 + 1       for |t| <= 1
+//	W(t) = a|t|^3 - 5a|t|^2 + 8a|t| - 4a     for 1 < |t| < 2
+//	W(t) = 0                                 otherwise
+func cubicKernel(t float64) float64 {
+	const a = -0.75
+	if t < 0 {
+		t = -t
+	}
+	if t <= 1 {
+		return ((a+2)*t-(a+3))*t*t + 1
+	}
+	if t < 2 {
+		return ((a*t-5*a)*t+8*a)*t - 4*a
+	}
+	return 0
+}
+
+// cubicWeights returns, for each output index along one axis, the four source
+// tap indices floor(s)-1 .. floor(s)+2 (clamped to [0, in-1], PyTorch border
+// handling) and their cubic kernel weights W(dist), where s follows the same
+// srcCoord convention as the linear modes. The four weights always sum to 1
+// (the kernel is a partition of unity), so clamping never denormalizes a row.
+func cubicWeights(in, out, r int, alignCorners bool) (idx [][4]int, w [][4]float64) {
+	idx = make([][4]int, out)
+	w = make([][4]float64, out)
+	for o := 0; o < out; o++ {
+		s := srcCoord(o, in, out, r, alignCorners)
+		lo := int(floorInt(s))
+		f := s - float64(lo)
+		for k := 0; k < 4; k++ {
+			idx[o][k] = clampInt(lo-1+k, 0, in-1)
+			w[o][k] = cubicKernel(f - float64(k-1))
+		}
+	}
+	return idx, w
 }
 
 // applyGather multiplies the flattened spatial dims of x by the transpose of
@@ -201,8 +242,32 @@ func (u *Upsample) forward4D(x *tensor.Tensor) *tensor.Tensor {
 			}
 		}
 		return applyGather(x, gData, rows, cols, N, C, outH, outW)
+
+	case "bicubic":
+		// Keys (1981) cubic convolution with a = -0.75 (PyTorch parity).
+		// Each output sample reads 4 taps per axis — 16 in 2D — at
+		// floor(s)-1 .. floor(s)+2 with border-clamped indices, using the
+		// same srcCoord source-coordinate convention as the linear modes.
+		rows := outH * outW
+		cols := H * W
+		yi, wy := cubicWeights(H, outH, r, u.AlignCorners)
+		xi, wx := cubicWeights(W, outW, r, u.AlignCorners)
+		gData := make([]float64, rows*cols)
+		for oh := 0; oh < outH; oh++ {
+			for ow := 0; ow < outW; ow++ {
+				row := oh*outW + ow
+				// 16 contributions: separable products of per-axis weights,
+				// accumulated because clamped taps can coincide at borders.
+				for a := 0; a < 4; a++ {
+					for b := 0; b < 4; b++ {
+						gData[row*cols+(yi[oh][a]*W+xi[ow][b])] += wy[oh][a] * wx[ow][b]
+					}
+				}
+			}
+		}
+		return applyGather(x, gData, rows, cols, N, C, outH, outW)
 	}
-	panic(fmt.Sprintf("Upsample: mode %q not supported for 4D input (want 'nearest' or 'bilinear')", u.Mode))
+	panic(fmt.Sprintf("Upsample: mode %q not supported for 4D input (want 'nearest', 'bilinear' or 'bicubic')", u.Mode))
 }
 
 // forward5D upsamples (N, C, D, H, W) with mode "nearest" or "trilinear".
