@@ -24,6 +24,7 @@ type convOpts struct {
 	outPad   []int
 	groups   int
 	bias     bool
+	padMode  string
 }
 
 // WithKernel overrides the symmetric kernel size with per-dimension sizes
@@ -53,6 +54,17 @@ func WithNoBias() ConvOpt { return func(o *convOpts) { o.bias = false } }
 // fanIn = (inC/g)*prod(kernel). groups > 1 runs g smaller unfold+GEMMs (one
 // per group) and concatenates along the channel axis. Default 1.
 func WithGroups(g int) ConvOpt { return func(o *convOpts) { o.groups = g } }
+
+// WithPaddingMode sets how the Pad border is filled (PyTorch padding_mode):
+// "zeros" (default), "reflect", "replicate" or "circular". Non-"zeros" modes
+// pre-pad the input spatially with the requested mode (before = after = Pad
+// per dim) and then convolve with zero internal padding — exactly PyTorch's
+// F.pad + conv(padding=0) decomposition — so the output size is unchanged.
+// Forward convolutions only; transposed convolutions support "zeros" only,
+// as in PyTorch. "reflect" requires Pad < input size and "circular" requires
+// Pad <= input size per spatial dim (checked at Forward time). The default
+// "zeros" takes the historical bit-identical code path.
+func WithPaddingMode(mode string) ConvOpt { return func(o *convOpts) { o.padMode = mode } }
 
 // WithOutputPadding adds extra zero rows/columns at the high edge of each
 // spatial dim of a transposed convolution's output (PyTorch output_padding):
@@ -103,6 +115,13 @@ func resolveConvOpts(rank, kernel int, opts []ConvOpt) convOpts {
 	if o.groups < 1 {
 		panic(fmt.Sprintf("nn: groups must be >= 1, got %d", o.groups))
 	}
+	switch o.padMode {
+	case "":
+		o.padMode = "zeros"
+	case "zeros", "reflect", "replicate", "circular":
+	default:
+		panic(fmt.Sprintf(`nn: padding_mode must be one of "zeros", "reflect", "replicate", "circular", got %q`, o.padMode))
+	}
 	return o
 }
 
@@ -112,18 +131,27 @@ type convNd struct {
 	InC, OutC                     int
 	Groups                        int
 	Kernel, Stride, Pad, Dilation []int
-	OutputPadding                 []int // transposed convs only; all-zero otherwise
+	OutputPadding                 []int  // transposed convs only; all-zero otherwise
+	PaddingMode                   string // "zeros" (default), "reflect", "replicate", "circular"
 	Transposed                    bool
 	Weight                        *tensor.Tensor // conv: (OutC, InC/Groups, K...); transposed: (InC, OutC/Groups, K...)
 	Bias                          *tensor.Tensor // (OutC,) or nil
 
 	// Single-entry gather cache keyed by input spatial size: the matrix is a
 	// constant leaf, so it is safe to reuse across forwards (training loops
-	// have fixed shapes; a shape change rebuilds it).
+	// have fixed shapes; a shape change rebuilds it). With a non-"zeros"
+	// PaddingMode the input is pre-padded first, so the key is the PADDED
+	// spatial size and the cached gather uses zero internal padding.
 	cacheKey                    []int
 	cachedG                     *tensor.Tensor
 	cachedOut                   []int
 	cachedNumWin, cachedWinSize int
+
+	// Pre-pad gather cache for non-"zeros" padding modes, keyed by the
+	// unpadded input spatial size.
+	padCacheKey  []int
+	cachedPadG   *tensor.Tensor
+	cachedPadOut []int
 }
 
 // initConv draws weights and bias exactly like the historical constructors:
@@ -139,6 +167,9 @@ func (c *convNd) initConv(rank, inC, outC, kernel int, transposed bool, opts []C
 		panic(fmt.Sprintf("nn: groups=%d must divide both inC=%d and outC=%d", o.groups, inC, outC))
 	}
 	if transposed {
+		if o.padMode != "zeros" {
+			panic(fmt.Sprintf(`nn: only "zeros" padding_mode is supported for transposed convolutions, got %q`, o.padMode))
+		}
 		for d := 0; d < rank; d++ {
 			if o.outPad[d] >= o.stride[d] {
 				panic(fmt.Sprintf("nn: output_padding %v must be smaller than stride %v per dim", o.outPad, o.stride))
@@ -154,6 +185,7 @@ func (c *convNd) initConv(rank, inC, outC, kernel int, transposed bool, opts []C
 	c.InC, c.OutC, c.Groups = inC, outC, o.groups
 	c.Kernel, c.Stride, c.Pad, c.Dilation = o.kernel, o.stride, o.pad, o.dilation
 	c.OutputPadding = o.outPad
+	c.PaddingMode = o.padMode
 	c.Transposed = transposed
 
 	winSize := prodInts(o.kernel)
@@ -180,13 +212,19 @@ func (c *convNd) initConv(rank, inC, outC, kernel int, transposed bool, opts []C
 }
 
 // gatherFor returns the (cached) gather matrix for the given spatial size.
+// With a non-"zeros" PaddingMode, spatial is the pre-padded size and the
+// gather uses zero internal padding (the border was already materialized).
 func (c *convNd) gatherFor(spatial []int) (*tensor.Tensor, []int, int, int) {
 	if c.cachedG != nil && intsEqual(c.cacheKey, spatial) {
 		return c.cachedG, c.cachedOut, c.cachedNumWin, c.cachedWinSize
 	}
+	pad := c.Pad
+	if c.PaddingMode != "" && c.PaddingMode != "zeros" {
+		pad = make([]int, len(spatial))
+	}
 	spec := slidingSpec{
 		In: append([]int(nil), spatial...), Kernel: c.Kernel,
-		Stride: c.Stride, Pad: c.Pad, Dilation: c.Dilation,
+		Stride: c.Stride, Pad: pad, Dilation: c.Dilation,
 		OutPad: c.OutputPadding,
 	}
 	var g *tensor.Tensor
@@ -244,6 +282,49 @@ func (c *convNd) groupWeightMat(i int) *tensor.Tensor {
 		Reshape(outCg, inCg*winSize)
 }
 
+// prePad spatially pads x with the layer's non-"zeros" padding mode
+// (before = after = Pad per dim) — PyTorch's F.pad step of padding_mode. The
+// 0/1 pad gather is a constant, so it is cached keyed on the unpadded spatial
+// size; the conv gather cache then keys on the padded size. Differentiable by
+// construction (a single matmul against a 0/1 matrix).
+func (c *convNd) prePad(x *tensor.Tensor) *tensor.Tensor {
+	spatial := x.Shape[2:]
+	if c.cachedPadG == nil || !intsEqual(c.padCacheKey, spatial) {
+		name := "nn: conv padding_mode=" + c.PaddingMode
+		var mode padModeFunc
+		switch c.PaddingMode {
+		case "reflect":
+			checkReflectPad(name, spatial, c.Pad, c.Pad)
+			mode = reflectIndex
+		case "replicate":
+			mode = replicateIndex
+		case "circular":
+			checkCircularPad(name, spatial, c.Pad, c.Pad)
+			mode = circularIndex
+		default:
+			panic(fmt.Sprintf("nn: invalid padding_mode %q", c.PaddingMode))
+		}
+		out, im := padND(spatial, c.Pad, c.Pad, mode)
+		c.padCacheKey = append([]int(nil), spatial...)
+		c.cachedPadOut = out
+		c.cachedPadG = indexMapGather(im, prodInts(spatial))
+	}
+	N, C := x.Shape[0], x.Shape[1]
+	return x.Reshape(N*C, prodInts(spatial)).
+		MatMul(c.cachedPadG.Transpose()).
+		Reshape(append([]int{N, C}, c.cachedPadOut...)...)
+}
+
+// allZeroInts reports whether every entry is zero.
+func allZeroInts(v []int) bool {
+	for _, x := range v {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // rangeIndex returns a 1-D index tensor [start, start+1, ..., start+n-1].
 func rangeIndex(start, n int) *tensor.Tensor {
 	d := make([]float64, n)
@@ -264,6 +345,9 @@ func (c *convNd) Forward(x *tensor.Tensor) *tensor.Tensor {
 	}
 	if x.Shape[1] != c.InC {
 		panic(fmt.Sprintf("nn: conv input channels %d != InC %d", x.Shape[1], c.InC))
+	}
+	if c.PaddingMode != "" && c.PaddingMode != "zeros" && !allZeroInts(c.Pad) {
+		x = c.prePad(x) // then convolve with zero internal padding
 	}
 	N := x.Shape[0]
 	g, out, numWin, winSize := c.gatherFor(x.Shape[2:])
@@ -313,8 +397,8 @@ func intsEqual(a, b []int) bool {
 type Conv1d struct{ convNd }
 
 // NewConv1d creates a Conv1d. Defaults: stride 1, no padding, dilation 1,
-// groups 1, bias on; configure with WithStride/WithPad/WithDilation/
-// WithGroups/WithNoBias.
+// groups 1, padding_mode "zeros", bias on; configure with WithStride/WithPad/
+// WithDilation/WithGroups/WithPaddingMode/WithNoBias.
 func NewConv1d(inC, outC, kernel int, opts ...ConvOpt) *Conv1d {
 	c := &Conv1d{}
 	c.initConv(1, inC, outC, kernel, false, opts)
