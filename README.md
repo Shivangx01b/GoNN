@@ -211,7 +211,8 @@ The GPU backend currently accelerates:
 **Elementwise dispatch policy.** Tensor storage is host memory, so a
 dispatched elementwise op pays a PCIe round trip. `tensor.SetDispatchPolicy`
 controls when ops route to the GPU: transcendental unaries dispatch above
-`UnaryMinElems` (default `1<<18` — they win once big enough), while
+`UnaryMinElems` (default `1<<16`, tuned from the measured break-even on an
+RTX 3060 — tanh at 64K elements is 3.2× faster dispatched), while
 bandwidth-bound binaries are **disabled by default** (`BinaryMinElems =
 MaxInt`) because the copy alone costs more than the compute. GEMMs always
 dispatch. The device-resident benchmark path (`cuda.DeviceBuffer`,

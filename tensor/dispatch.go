@@ -46,7 +46,10 @@ const (
 // capability AND accepts the call; otherwise the pure-Go loop runs.
 type DispatchPolicy struct {
 	// UnaryMinElems is the minimum element count for dispatching unary ops
-	// (activations, exp, log, ...). Default 1<<18.
+	// (activations, exp, log, ...). Default 1<<16, tuned from the measured
+	// break-even on an RTX 3060 (benchmark/gonn dispatch table: tanh at 64K
+	// elems runs 3.2x faster dispatched — 0.22ms vs 0.70ms host — and is
+	// already at parity by 16K thanks to the kernel-side workspace cache).
 	UnaryMinElems int
 	// BinaryMinElems is the minimum element count for dispatching binary ops
 	// (add/sub/mul/div). Default math.MaxInt (disabled): with host-resident
@@ -57,7 +60,7 @@ type DispatchPolicy struct {
 var dispatchPolicy atomic.Pointer[DispatchPolicy]
 
 func init() {
-	p := DispatchPolicy{UnaryMinElems: 1 << 18, BinaryMinElems: math.MaxInt}
+	p := DispatchPolicy{UnaryMinElems: 1 << 16, BinaryMinElems: math.MaxInt}
 	dispatchPolicy.Store(&p)
 }
 

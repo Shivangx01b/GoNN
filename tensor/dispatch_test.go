@@ -159,7 +159,7 @@ func TestDefaultPolicyBinaryDisabled(t *testing.T) {
 	if p.BinaryMinElems != math.MaxInt {
 		t.Fatalf("default BinaryMinElems = %d, want MaxInt (disabled)", p.BinaryMinElems)
 	}
-	if p.UnaryMinElems != 1<<18 {
-		t.Fatalf("default UnaryMinElems = %d, want %d", p.UnaryMinElems, 1<<18)
+	if p.UnaryMinElems != 1<<16 {
+		t.Fatalf("default UnaryMinElems = %d, want %d", p.UnaryMinElems, 1<<16)
 	}
 }

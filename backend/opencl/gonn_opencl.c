@@ -1,4 +1,11 @@
+//go:build opencl
+
 // gonn_opencl.c — OpenCL backend kernels + host glue for GoNN.
+//
+// The go:build constraint above keeps this C source out of non-opencl
+// builds: without it, any CGO-enabled build of ./... (e.g. -tags cuda in
+// the Docker image) fails with "C source files not allowed when not using
+// cgo or SWIG", because the stub build of this package doesn't use cgo.
 //
 // Build is driven by CGO (see opencl.go) with -tags opencl. The OpenCL ICD and
 // headers ship with the CUDA toolkit (e.g. /usr/local/cuda/{include,lib64}).
