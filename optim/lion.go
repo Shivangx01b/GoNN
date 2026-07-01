@@ -14,12 +14,9 @@ import (
 //
 // Defaults: beta1=0.9, beta2=0.99, weight_decay=0.
 type Lion struct {
-	params      []*tensor.Tensor
-	lr          float64
-	beta1       float64
-	beta2       float64
-	weightDecay float64
-	m           map[*tensor.Tensor][]float64
+	baseOptimizer
+	beta1 float64
+	beta2 float64
 }
 
 // LionOption configures a Lion optimizer.
@@ -31,18 +28,28 @@ func WithLionBeta1(b float64) LionOption { return func(l *Lion) { l.beta1 = b } 
 // WithLionBeta2 sets the beta2 coefficient (momentum EMA).
 func WithLionBeta2(b float64) LionOption { return func(l *Lion) { l.beta2 = b } }
 
-// WithLionWeightDecay sets the decoupled weight decay coefficient.
-func WithLionWeightDecay(wd float64) LionOption { return func(l *Lion) { l.weightDecay = wd } }
+// WithLionWeightDecay sets the decoupled weight decay coefficient on every
+// group. With NewLionGroups, prefer setting Group.WeightDecay directly.
+func WithLionWeightDecay(wd float64) LionOption {
+	return func(l *Lion) {
+		for i := range l.groups {
+			l.groups[i].WeightDecay = wd
+		}
+	}
+}
 
 // NewLion constructs a Lion optimizer with defaults beta1=0.9, beta2=0.99,
 // weight_decay=0.
 func NewLion(params []*tensor.Tensor, lr float64, opts ...LionOption) *Lion {
+	return NewLionGroups(singleGroup(params, lr), opts...)
+}
+
+// NewLionGroups constructs a Lion optimizer over explicit parameter groups.
+func NewLionGroups(groups []Group, opts ...LionOption) *Lion {
 	l := &Lion{
-		params: params,
-		lr:     lr,
-		beta1:  0.9,
-		beta2:  0.99,
-		m:      make(map[*tensor.Tensor][]float64),
+		baseOptimizer: newBase(groups),
+		beta1:         0.9,
+		beta2:         0.99,
 	}
 	for _, opt := range opts {
 		opt(l)
@@ -52,39 +59,18 @@ func NewLion(params []*tensor.Tensor, lr float64, opts ...LionOption) *Lion {
 
 // Step performs a single Lion update.
 func (l *Lion) Step() {
-	for _, p := range l.params {
-		if p == nil || p.Grad == nil {
-			continue
-		}
-		grad := p.Grad.Data
-		data := p.Data
-		m := l.m[p]
-		if m == nil {
-			m = make([]float64, len(data))
-			l.m[p] = m
-		}
+	l.forEachParam(func(grp *Group, p *tensor.Tensor, data, grad []float64, st *State) {
+		m := st.Buf("m", len(data))
 		for i := range data {
 			g := grad[i]
 			c := l.beta1*m[i] + (1-l.beta1)*g
 			update := sign(c)
-			if l.weightDecay != 0 {
-				data[i] -= l.lr * (update + l.weightDecay*data[i])
+			if grp.WeightDecay != 0 {
+				data[i] -= grp.LR * (update + grp.WeightDecay*data[i])
 			} else {
-				data[i] -= l.lr * update
+				data[i] -= grp.LR * update
 			}
 			m[i] = l.beta2*m[i] + (1-l.beta2)*g
 		}
-	}
+	})
 }
-
-// ZeroGrad zeros the gradients of all parameters.
-func (l *Lion) ZeroGrad() { zeroGradAll(l.params) }
-
-// Parameters returns the parameter list.
-func (l *Lion) Parameters() []*tensor.Tensor { return l.params }
-
-// LR returns the current learning rate.
-func (l *Lion) LR() float64 { return l.lr }
-
-// SetLR updates the learning rate.
-func (l *Lion) SetLR(lr float64) { l.lr = lr }

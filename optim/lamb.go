@@ -20,15 +20,11 @@ import (
 //
 // Defaults: beta1=0.9, beta2=0.999, eps=1e-6, weight_decay=0.
 type LAMB struct {
-	params      []*tensor.Tensor
-	lr          float64
-	beta1       float64
-	beta2       float64
-	eps         float64
-	weightDecay float64
-	m           map[*tensor.Tensor][]float64
-	v           map[*tensor.Tensor][]float64
-	t           int
+	baseOptimizer
+	beta1 float64
+	beta2 float64
+	eps   float64
+	t     int
 }
 
 // LAMBOption configures a LAMB optimizer.
@@ -43,20 +39,29 @@ func WithLAMBBeta2(b float64) LAMBOption { return func(l *LAMB) { l.beta2 = b } 
 // WithLAMBEps sets the epsilon term.
 func WithLAMBEps(e float64) LAMBOption { return func(l *LAMB) { l.eps = e } }
 
-// WithLAMBWeightDecay sets the decoupled weight decay coefficient.
-func WithLAMBWeightDecay(wd float64) LAMBOption { return func(l *LAMB) { l.weightDecay = wd } }
+// WithLAMBWeightDecay sets the decoupled weight decay coefficient on every
+// group. With NewLAMBGroups, prefer setting Group.WeightDecay directly.
+func WithLAMBWeightDecay(wd float64) LAMBOption {
+	return func(l *LAMB) {
+		for i := range l.groups {
+			l.groups[i].WeightDecay = wd
+		}
+	}
+}
 
 // NewLAMB constructs a LAMB optimizer with defaults beta1=0.9, beta2=0.999,
 // eps=1e-6, weight_decay=0.
 func NewLAMB(params []*tensor.Tensor, lr float64, opts ...LAMBOption) *LAMB {
+	return NewLAMBGroups(singleGroup(params, lr), opts...)
+}
+
+// NewLAMBGroups constructs a LAMB optimizer over explicit parameter groups.
+func NewLAMBGroups(groups []Group, opts ...LAMBOption) *LAMB {
 	l := &LAMB{
-		params: params,
-		lr:     lr,
-		beta1:  0.9,
-		beta2:  0.999,
-		eps:    1e-6,
-		m:      make(map[*tensor.Tensor][]float64),
-		v:      make(map[*tensor.Tensor][]float64),
+		baseOptimizer: newBase(groups),
+		beta1:         0.9,
+		beta2:         0.999,
+		eps:           1e-6,
 	}
 	for _, opt := range opts {
 		opt(l)
@@ -69,22 +74,9 @@ func (l *LAMB) Step() {
 	l.t++
 	bc1 := 1 - math.Pow(l.beta1, float64(l.t))
 	bc2 := 1 - math.Pow(l.beta2, float64(l.t))
-	for _, p := range l.params {
-		if p == nil || p.Grad == nil {
-			continue
-		}
-		grad := p.Grad.Data
-		data := p.Data
-		m := l.m[p]
-		if m == nil {
-			m = make([]float64, len(data))
-			l.m[p] = m
-		}
-		v := l.v[p]
-		if v == nil {
-			v = make([]float64, len(data))
-			l.v[p] = v
-		}
+	l.forEachParam(func(grp *Group, p *tensor.Tensor, data, grad []float64, st *State) {
+		m := st.Buf("m", len(data))
+		v := st.Buf("v", len(data))
 
 		update := make([]float64, len(data))
 		var paramNorm, updNorm float64
@@ -95,8 +87,8 @@ func (l *LAMB) Step() {
 			mHat := m[i] / bc1
 			vHat := v[i] / bc2
 			u := mHat / (math.Sqrt(vHat) + l.eps)
-			if l.weightDecay != 0 {
-				u += l.weightDecay * data[i]
+			if grp.WeightDecay != 0 {
+				u += grp.WeightDecay * data[i]
 			}
 			update[i] = u
 			paramNorm += data[i] * data[i]
@@ -110,19 +102,7 @@ func (l *LAMB) Step() {
 			trust = paramNorm / updNorm
 		}
 		for i := range data {
-			data[i] -= l.lr * trust * update[i]
+			data[i] -= grp.LR * trust * update[i]
 		}
-	}
+	})
 }
-
-// ZeroGrad zeros the gradients of all parameters.
-func (l *LAMB) ZeroGrad() { zeroGradAll(l.params) }
-
-// Parameters returns the parameter list.
-func (l *LAMB) Parameters() []*tensor.Tensor { return l.params }
-
-// LR returns the current learning rate.
-func (l *LAMB) LR() float64 { return l.lr }
-
-// SetLR updates the learning rate.
-func (l *LAMB) SetLR(lr float64) { l.lr = lr }

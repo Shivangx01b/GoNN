@@ -19,18 +19,10 @@ import (
 //
 // and the averaged buffer ax accumulates ax += mu*(param - ax).
 type ASGD struct {
-	params      []*tensor.Tensor
-	lr          float64
-	lambda      float64
-	alpha       float64
-	t0          float64
-	weightDecay float64
-
-	// per-param state
-	ax   map[*tensor.Tensor][]float64
-	eta  map[*tensor.Tensor]float64
-	mu   map[*tensor.Tensor]float64
-	step map[*tensor.Tensor]float64
+	baseOptimizer
+	lambda float64
+	alpha  float64
+	t0     float64
 }
 
 // ASGDOption configures an ASGD optimizer.
@@ -45,22 +37,29 @@ func WithASGDAlpha(al float64) ASGDOption { return func(a *ASGD) { a.alpha = al 
 // WithASGDT0 sets the point at which averaging starts.
 func WithASGDT0(t0 float64) ASGDOption { return func(a *ASGD) { a.t0 = t0 } }
 
-// WithASGDWeightDecay sets the L2 weight decay coefficient.
-func WithASGDWeightDecay(wd float64) ASGDOption { return func(a *ASGD) { a.weightDecay = wd } }
+// WithASGDWeightDecay sets the L2 weight decay coefficient on every group.
+// With NewASGDGroups, prefer setting Group.WeightDecay directly.
+func WithASGDWeightDecay(wd float64) ASGDOption {
+	return func(a *ASGD) {
+		for i := range a.groups {
+			a.groups[i].WeightDecay = wd
+		}
+	}
+}
 
 // NewASGD constructs an ASGD optimizer with defaults lambda=1e-4, alpha=0.75,
 // t0=1e6, weight_decay=0.
 func NewASGD(params []*tensor.Tensor, lr float64, opts ...ASGDOption) *ASGD {
+	return NewASGDGroups(singleGroup(params, lr), opts...)
+}
+
+// NewASGDGroups constructs an ASGD optimizer over explicit parameter groups.
+func NewASGDGroups(groups []Group, opts ...ASGDOption) *ASGD {
 	a := &ASGD{
-		params: params,
-		lr:     lr,
-		lambda: 1e-4,
-		alpha:  0.75,
-		t0:     1e6,
-		ax:     make(map[*tensor.Tensor][]float64),
-		eta:    make(map[*tensor.Tensor]float64),
-		mu:     make(map[*tensor.Tensor]float64),
-		step:   make(map[*tensor.Tensor]float64),
+		baseOptimizer: newBase(groups),
+		lambda:        1e-4,
+		alpha:         0.75,
+		t0:            1e6,
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -70,31 +69,21 @@ func NewASGD(params []*tensor.Tensor, lr float64, opts ...ASGDOption) *ASGD {
 
 // Step performs a single ASGD update.
 func (a *ASGD) Step() {
-	for _, p := range a.params {
-		if p == nil || p.Grad == nil {
-			continue
+	a.forEachParam(func(grp *Group, p *tensor.Tensor, data, grad []float64, st *State) {
+		if !st.Has("ax") {
+			st.SetScalar("eta", grp.LR)
+			st.SetScalar("mu", 1)
+			st.SetScalar("step", 0)
 		}
-		grad := p.Grad.Data
-		data := p.Data
-		ax := a.ax[p]
-		if ax == nil {
-			ax = make([]float64, len(data))
-			a.ax[p] = ax
-			a.eta[p] = a.lr
-			a.mu[p] = 1
-			a.step[p] = 0
-		}
+		ax := st.Buf("ax", len(data))
 
-		a.step[p]++
-		t := a.step[p]
-		eta := a.eta[p]
-		mu := a.mu[p]
+		st.SetScalar("step", st.Scalar("step")+1)
+		t := st.Scalar("step")
+		eta := st.Scalar("eta")
+		mu := st.Scalar("mu")
 
 		for i := range data {
-			g := grad[i]
-			if a.weightDecay != 0 {
-				g += a.weightDecay * data[i]
-			}
+			g := coupledWD(grad[i], data[i], grp.WeightDecay)
 			// decay term (PyTorch: param.mul_(1 - lambda*eta))
 			data[i] *= 1 - a.lambda*eta
 			// gradient step
@@ -108,23 +97,17 @@ func (a *ASGD) Step() {
 		}
 
 		// update eta and mu schedules for next step
-		a.eta[p] = a.lr / math.Pow(1+a.lambda*a.lr*t, a.alpha)
-		a.mu[p] = 1 / math.Max(1, t-a.t0)
-	}
+		st.SetScalar("eta", grp.LR/math.Pow(1+a.lambda*grp.LR*t, a.alpha))
+		st.SetScalar("mu", 1/math.Max(1, t-a.t0))
+	})
 }
 
 // AveragedParam returns the averaged weight buffer (ax) for a parameter, or nil
 // if the parameter has not been stepped yet.
-func (a *ASGD) AveragedParam(p *tensor.Tensor) []float64 { return a.ax[p] }
-
-// ZeroGrad zeros the gradients of all parameters.
-func (a *ASGD) ZeroGrad() { zeroGradAll(a.params) }
-
-// Parameters returns the parameter list.
-func (a *ASGD) Parameters() []*tensor.Tensor { return a.params }
-
-// LR returns the current learning rate.
-func (a *ASGD) LR() float64 { return a.lr }
-
-// SetLR updates the learning rate.
-func (a *ASGD) SetLR(lr float64) { a.lr = lr }
+func (a *ASGD) AveragedParam(p *tensor.Tensor) []float64 {
+	st := a.states[p]
+	if st == nil || !st.Has("ax") {
+		return nil
+	}
+	return st.Buf("ax", 0)
+}

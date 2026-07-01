@@ -27,15 +27,11 @@ import (
 // clip_threshold=1.0, decay_rate=-0.8 by default. No momentum (beta1=0) and no
 // weight decay, matching torch.optim defaults.
 type Adafactor struct {
-	params        []*tensor.Tensor
-	lr            float64
+	baseOptimizer
 	eps1          float64
 	eps2          float64
 	clipThreshold float64
 	decayRate     float64
-
-	v    map[*tensor.Tensor][]float64
-	step map[*tensor.Tensor]int
 }
 
 // AdafactorOption configures an Adafactor optimizer.
@@ -60,16 +56,20 @@ func WithAdafactorDecayRate(d float64) AdafactorOption {
 // NewAdafactor constructs an Adafactor optimizer with defaults eps1=1e-30,
 // eps2=1e-3, clip_threshold=1.0, decay_rate=-0.8. The lr argument acts as the
 // upper bound on the relative step size (PyTorch's relative_step cap).
+// Group.WeightDecay is ignored by Adafactor.
 func NewAdafactor(params []*tensor.Tensor, lr float64, opts ...AdafactorOption) *Adafactor {
+	return NewAdafactorGroups(singleGroup(params, lr), opts...)
+}
+
+// NewAdafactorGroups constructs an Adafactor optimizer over explicit parameter
+// groups. Group.WeightDecay is ignored by Adafactor.
+func NewAdafactorGroups(groups []Group, opts ...AdafactorOption) *Adafactor {
 	a := &Adafactor{
-		params:        params,
-		lr:            lr,
+		baseOptimizer: newBase(groups),
 		eps1:          1e-30,
 		eps2:          1e-3,
 		clipThreshold: 1.0,
 		decayRate:     -0.8,
-		v:             make(map[*tensor.Tensor][]float64),
-		step:          make(map[*tensor.Tensor]int),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -90,24 +90,16 @@ func rms(x []float64) float64 {
 
 // Step performs a single Adafactor update.
 func (a *Adafactor) Step() {
-	for _, p := range a.params {
-		if p == nil || p.Grad == nil {
-			continue
-		}
-		grad := p.Grad.Data
-		data := p.Data
-		v := a.v[p]
-		if v == nil {
-			v = make([]float64, len(data))
-			a.v[p] = v
-		}
-		a.step[p]++
-		t := float64(a.step[p])
+	a.forEachParam(func(grp *Group, p *tensor.Tensor, data, grad []float64, st *State) {
+		v := st.Buf("v", len(data))
+		step := st.Scalar("step") + 1
+		st.SetScalar("step", step)
+		t := step
 
 		beta2hat := 1 - math.Pow(t, a.decayRate)
 
 		// relative step size: min(1/sqrt(t), lr), scaled by param RMS.
-		relStep := math.Min(1/math.Sqrt(t), a.lr)
+		relStep := math.Min(1/math.Sqrt(t), grp.LR)
 		paramRMS := math.Max(a.eps2, rms(data))
 		alpha := paramRMS * relStep
 
@@ -124,17 +116,5 @@ func (a *Adafactor) Step() {
 		for i := range data {
 			data[i] -= alpha * update[i] / denom
 		}
-	}
+	})
 }
-
-// ZeroGrad zeros the gradients of all parameters.
-func (a *Adafactor) ZeroGrad() { zeroGradAll(a.params) }
-
-// Parameters returns the parameter list.
-func (a *Adafactor) Parameters() []*tensor.Tensor { return a.params }
-
-// LR returns the current learning rate.
-func (a *Adafactor) LR() float64 { return a.lr }
-
-// SetLR updates the learning rate.
-func (a *Adafactor) SetLR(lr float64) { a.lr = lr }

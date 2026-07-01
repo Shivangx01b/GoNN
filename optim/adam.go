@@ -6,17 +6,14 @@ import (
 	"gonn/tensor"
 )
 
-// Adam implements the Adam optimizer (Kingma & Ba, 2014).
+// Adam implements the Adam optimizer (Kingma & Ba, 2014). Weight decay is
+// coupled L2 (added to the gradient); for decoupled decay use AdamW.
 type Adam struct {
-	params      []*tensor.Tensor
-	lr          float64
-	beta1       float64
-	beta2       float64
-	eps         float64
-	weightDecay float64
-	m           map[*tensor.Tensor][]float64
-	v           map[*tensor.Tensor][]float64
-	t           int
+	baseOptimizer
+	beta1 float64
+	beta2 float64
+	eps   float64
+	t     int
 }
 
 // AdamOption configures an Adam optimizer.
@@ -31,19 +28,28 @@ func WithBeta2(b float64) AdamOption { return func(a *Adam) { a.beta2 = b } }
 // WithAdamEps sets the epsilon term.
 func WithAdamEps(e float64) AdamOption { return func(a *Adam) { a.eps = e } }
 
-// WithAdamWeightDecay sets the L2 weight decay coefficient.
-func WithAdamWeightDecay(wd float64) AdamOption { return func(a *Adam) { a.weightDecay = wd } }
+// WithAdamWeightDecay sets the L2 weight decay coefficient on every group.
+// With NewAdamGroups, prefer setting Group.WeightDecay directly.
+func WithAdamWeightDecay(wd float64) AdamOption {
+	return func(a *Adam) {
+		for i := range a.groups {
+			a.groups[i].WeightDecay = wd
+		}
+	}
+}
 
 // NewAdam constructs an Adam optimizer with defaults beta1=0.9, beta2=0.999, eps=1e-8.
 func NewAdam(params []*tensor.Tensor, lr float64, opts ...AdamOption) *Adam {
+	return NewAdamGroups(singleGroup(params, lr), opts...)
+}
+
+// NewAdamGroups constructs an Adam optimizer over explicit parameter groups.
+func NewAdamGroups(groups []Group, opts ...AdamOption) *Adam {
 	a := &Adam{
-		params: params,
-		lr:     lr,
-		beta1:  0.9,
-		beta2:  0.999,
-		eps:    1e-8,
-		m:      make(map[*tensor.Tensor][]float64),
-		v:      make(map[*tensor.Tensor][]float64),
+		baseOptimizer: newBase(groups),
+		beta1:         0.9,
+		beta2:         0.999,
+		eps:           1e-8,
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -56,44 +62,16 @@ func (a *Adam) Step() {
 	a.t++
 	bc1 := 1 - math.Pow(a.beta1, float64(a.t))
 	bc2 := 1 - math.Pow(a.beta2, float64(a.t))
-	for _, p := range a.params {
-		if p == nil || p.Grad == nil {
-			continue
-		}
-		grad := p.Grad.Data
-		data := p.Data
-		m := a.m[p]
-		if m == nil {
-			m = make([]float64, len(data))
-			a.m[p] = m
-		}
-		v := a.v[p]
-		if v == nil {
-			v = make([]float64, len(data))
-			a.v[p] = v
-		}
+	a.forEachParam(func(grp *Group, p *tensor.Tensor, data, grad []float64, st *State) {
+		m := st.Buf("m", len(data))
+		v := st.Buf("v", len(data))
 		for i := range data {
-			g := grad[i]
-			if a.weightDecay != 0 {
-				g += a.weightDecay * data[i]
-			}
+			g := coupledWD(grad[i], data[i], grp.WeightDecay)
 			m[i] = a.beta1*m[i] + (1-a.beta1)*g
 			v[i] = a.beta2*v[i] + (1-a.beta2)*g*g
 			mHat := m[i] / bc1
 			vHat := v[i] / bc2
-			data[i] -= a.lr * mHat / (math.Sqrt(vHat) + a.eps)
+			data[i] -= grp.LR * mHat / (math.Sqrt(vHat) + a.eps)
 		}
-	}
+	})
 }
-
-// ZeroGrad zeros the gradients of all parameters.
-func (a *Adam) ZeroGrad() { zeroGradAll(a.params) }
-
-// Parameters returns the parameter list.
-func (a *Adam) Parameters() []*tensor.Tensor { return a.params }
-
-// LR returns the current learning rate.
-func (a *Adam) LR() float64 { return a.lr }
-
-// SetLR updates the learning rate.
-func (a *Adam) SetLR(lr float64) { a.lr = lr }

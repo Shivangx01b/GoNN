@@ -13,13 +13,12 @@ import (
 // closure that re-runs the forward pass, clears any old grads, calls
 // Backward, and returns the loss value.
 type LBFGS struct {
-	params      []*tensor.Tensor
-	lr          float64
+	baseOptimizer
 	HistorySize int
 	MaxIter     int
 
 	// State carried across Step calls.
-	prevFlatGrad []float64
+	prevFlatGrad  []float64
 	prevFlatParam []float64
 	sHistory      [][]float64
 	yHistory      [][]float64
@@ -38,15 +37,17 @@ func WithLBFGSMaxIter(n int) LBFGSOption { return func(l *LBFGS) { l.MaxIter = n
 
 // NewLBFGS constructs an LBFGS optimizer with defaults
 // HistorySize=10, MaxIter=20, lr=1.
+//
+// There is no groups variant — the global line search makes per-group LRs
+// meaningless; Group.WeightDecay is ignored.
 func NewLBFGS(params []*tensor.Tensor, lr float64, opts ...LBFGSOption) *LBFGS {
 	if lr == 0 {
 		lr = 1
 	}
 	l := &LBFGS{
-		params:      params,
-		lr:          lr,
-		HistorySize: 10,
-		MaxIter:     20,
+		baseOptimizer: newBase(singleGroup(params, lr)),
+		HistorySize:   10,
+		MaxIter:       20,
 	}
 	for _, opt := range opts {
 		opt(l)
@@ -56,8 +57,9 @@ func NewLBFGS(params []*tensor.Tensor, lr float64, opts ...LBFGSOption) *LBFGS {
 
 // totalNumel returns the number of scalar parameters across all tensors.
 func (l *LBFGS) totalNumel() int {
+	params := l.Parameters()
 	n := 0
-	for _, p := range l.params {
+	for _, p := range params {
 		if p == nil {
 			continue
 		}
@@ -69,8 +71,9 @@ func (l *LBFGS) totalNumel() int {
 // gatherFlatGrad returns a fresh flat vector of gradients for all params.
 // Missing grads are treated as zero.
 func (l *LBFGS) gatherFlatGrad() []float64 {
+	params := l.Parameters()
 	out := make([]float64, 0, l.totalNumel())
-	for _, p := range l.params {
+	for _, p := range params {
 		if p == nil {
 			continue
 		}
@@ -85,8 +88,9 @@ func (l *LBFGS) gatherFlatGrad() []float64 {
 
 // gatherFlatParam returns a fresh flat copy of param data.
 func (l *LBFGS) gatherFlatParam() []float64 {
+	params := l.Parameters()
 	out := make([]float64, 0, l.totalNumel())
-	for _, p := range l.params {
+	for _, p := range params {
 		if p == nil {
 			continue
 		}
@@ -97,8 +101,9 @@ func (l *LBFGS) gatherFlatParam() []float64 {
 
 // scatterParam writes flat back into the underlying parameter tensors.
 func (l *LBFGS) scatterParam(flat []float64) {
+	params := l.Parameters()
 	off := 0
-	for _, p := range l.params {
+	for _, p := range params {
 		if p == nil {
 			continue
 		}
@@ -109,8 +114,9 @@ func (l *LBFGS) scatterParam(flat []float64) {
 
 // addToParams updates params <- params + alpha*direction (direction is flat).
 func (l *LBFGS) addToParams(alpha float64, direction []float64) {
+	params := l.Parameters()
 	off := 0
-	for _, p := range l.params {
+	for _, p := range params {
 		if p == nil {
 			continue
 		}
@@ -207,7 +213,7 @@ func (l *LBFGS) Step(closure func() float64) float64 {
 		copy(gPrev, flatGrad)
 
 		// Backtracking line search.
-		alpha := l.lr
+		alpha := l.LR()
 		const c1 = 1e-4
 		const shrink = 0.5
 		const maxLS = 20
@@ -278,15 +284,3 @@ func dot(a, b []float64) float64 {
 	}
 	return s
 }
-
-// ZeroGrad zeros the gradients of all parameters.
-func (l *LBFGS) ZeroGrad() { zeroGradAll(l.params) }
-
-// Parameters returns the parameter list.
-func (l *LBFGS) Parameters() []*tensor.Tensor { return l.params }
-
-// LR returns the (initial line-search) step size.
-func (l *LBFGS) LR() float64 { return l.lr }
-
-// SetLR updates the initial line-search step size.
-func (l *LBFGS) SetLR(lr float64) { l.lr = lr }

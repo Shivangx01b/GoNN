@@ -9,15 +9,11 @@ import (
 // Adamax implements the Adamax optimizer (Kingma & Ba, 2014), a variant of
 // Adam based on the infinity norm.
 type Adamax struct {
-	params      []*tensor.Tensor
-	lr          float64
-	beta1       float64
-	beta2       float64
-	eps         float64
-	weightDecay float64
-	m           map[*tensor.Tensor][]float64
-	u           map[*tensor.Tensor][]float64
-	t           int
+	baseOptimizer
+	beta1 float64
+	beta2 float64
+	eps   float64
+	t     int
 }
 
 // AdamaxOption configures an Adamax optimizer.
@@ -32,20 +28,29 @@ func WithAdamaxBeta2(b float64) AdamaxOption { return func(a *Adamax) { a.beta2 
 // WithAdamaxEps sets the epsilon term.
 func WithAdamaxEps(e float64) AdamaxOption { return func(a *Adamax) { a.eps = e } }
 
-// WithAdamaxWeightDecay sets the L2 weight decay coefficient.
-func WithAdamaxWeightDecay(wd float64) AdamaxOption { return func(a *Adamax) { a.weightDecay = wd } }
+// WithAdamaxWeightDecay sets the L2 weight decay coefficient on every group.
+// With NewAdamaxGroups, prefer setting Group.WeightDecay directly.
+func WithAdamaxWeightDecay(wd float64) AdamaxOption {
+	return func(a *Adamax) {
+		for i := range a.groups {
+			a.groups[i].WeightDecay = wd
+		}
+	}
+}
 
 // NewAdamax constructs an Adamax optimizer with defaults beta1=0.9,
 // beta2=0.999, eps=1e-8, weight_decay=0.
 func NewAdamax(params []*tensor.Tensor, lr float64, opts ...AdamaxOption) *Adamax {
+	return NewAdamaxGroups(singleGroup(params, lr), opts...)
+}
+
+// NewAdamaxGroups constructs an Adamax optimizer over explicit parameter groups.
+func NewAdamaxGroups(groups []Group, opts ...AdamaxOption) *Adamax {
 	a := &Adamax{
-		params: params,
-		lr:     lr,
-		beta1:  0.9,
-		beta2:  0.999,
-		eps:    1e-8,
-		m:      make(map[*tensor.Tensor][]float64),
-		u:      make(map[*tensor.Tensor][]float64),
+		baseOptimizer: newBase(groups),
+		beta1:         0.9,
+		beta2:         0.999,
+		eps:           1e-8,
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -57,27 +62,11 @@ func NewAdamax(params []*tensor.Tensor, lr float64, opts ...AdamaxOption) *Adama
 func (a *Adamax) Step() {
 	a.t++
 	bc1 := 1 - math.Pow(a.beta1, float64(a.t))
-	for _, p := range a.params {
-		if p == nil || p.Grad == nil {
-			continue
-		}
-		grad := p.Grad.Data
-		data := p.Data
-		m := a.m[p]
-		if m == nil {
-			m = make([]float64, len(data))
-			a.m[p] = m
-		}
-		u := a.u[p]
-		if u == nil {
-			u = make([]float64, len(data))
-			a.u[p] = u
-		}
+	a.forEachParam(func(grp *Group, p *tensor.Tensor, data, grad []float64, st *State) {
+		m := st.Buf("m", len(data))
+		u := st.Buf("u", len(data))
 		for i := range data {
-			g := grad[i]
-			if a.weightDecay != 0 {
-				g += a.weightDecay * data[i]
-			}
+			g := coupledWD(grad[i], data[i], grp.WeightDecay)
 			m[i] = a.beta1*m[i] + (1-a.beta1)*g
 			absG := math.Abs(g)
 			scaled := a.beta2 * u[i]
@@ -86,19 +75,7 @@ func (a *Adamax) Step() {
 			} else {
 				u[i] = scaled
 			}
-			data[i] -= (a.lr / bc1) * m[i] / (u[i] + a.eps)
+			data[i] -= (grp.LR / bc1) * m[i] / (u[i] + a.eps)
 		}
-	}
+	})
 }
-
-// ZeroGrad zeros the gradients of all parameters.
-func (a *Adamax) ZeroGrad() { zeroGradAll(a.params) }
-
-// Parameters returns the parameter list.
-func (a *Adamax) Parameters() []*tensor.Tensor { return a.params }
-
-// LR returns the current learning rate.
-func (a *Adamax) LR() float64 { return a.lr }
-
-// SetLR updates the learning rate.
-func (a *Adamax) SetLR(lr float64) { a.lr = lr }

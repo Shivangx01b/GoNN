@@ -10,14 +10,11 @@ import (
 // Braun, 1993). Each parameter element keeps its own step size that grows
 // when the gradient sign is stable and shrinks when it flips.
 type Rprop struct {
-	params       []*tensor.Tensor
-	lr           float64 // base step size used to initialize per-element sizes
-	etaMinus     float64
-	etaPlus      float64
-	stepMin      float64
-	stepMax      float64
-	prevGrad     map[*tensor.Tensor][]float64
-	stepSize     map[*tensor.Tensor][]float64
+	baseOptimizer
+	etaMinus float64
+	etaPlus  float64
+	stepMin  float64
+	stepMax  float64
 }
 
 // RpropOption configures a Rprop optimizer.
@@ -40,17 +37,21 @@ func WithRpropStepBounds(min, max float64) RpropOption {
 // NewRprop constructs a Rprop optimizer. lr is used as the initial per-element
 // step size (PyTorch defaults to 0.01; we follow the task spec and use it as
 // the user-supplied initial step). Defaults: eta_minus=0.5, eta_plus=1.2,
-// step bounds = (1e-6, 50).
+// step bounds = (1e-6, 50). Group.WeightDecay is ignored by Rprop.
 func NewRprop(params []*tensor.Tensor, lr float64, opts ...RpropOption) *Rprop {
+	return NewRpropGroups(singleGroup(params, lr), opts...)
+}
+
+// NewRpropGroups constructs a Rprop optimizer over explicit parameter groups.
+// Each group's LR seeds that group's initial per-element step sizes.
+// Group.WeightDecay is ignored by Rprop.
+func NewRpropGroups(groups []Group, opts ...RpropOption) *Rprop {
 	r := &Rprop{
-		params:   params,
-		lr:       lr,
-		etaMinus: 0.5,
-		etaPlus:  1.2,
-		stepMin:  1e-6,
-		stepMax:  50,
-		prevGrad: make(map[*tensor.Tensor][]float64),
-		stepSize: make(map[*tensor.Tensor][]float64),
+		baseOptimizer: newBase(groups),
+		etaMinus:      0.5,
+		etaPlus:       1.2,
+		stepMin:       1e-6,
+		stepMax:       50,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -60,25 +61,9 @@ func NewRprop(params []*tensor.Tensor, lr float64, opts ...RpropOption) *Rprop {
 
 // Step performs a single Rprop update.
 func (r *Rprop) Step() {
-	for _, p := range r.params {
-		if p == nil || p.Grad == nil {
-			continue
-		}
-		grad := p.Grad.Data
-		data := p.Data
-		prev := r.prevGrad[p]
-		if prev == nil {
-			prev = make([]float64, len(data))
-			r.prevGrad[p] = prev
-		}
-		step := r.stepSize[p]
-		if step == nil {
-			step = make([]float64, len(data))
-			for i := range step {
-				step[i] = r.lr
-			}
-			r.stepSize[p] = step
-		}
+	r.forEachParam(func(grp *Group, p *tensor.Tensor, data, grad []float64, st *State) {
+		prev := st.Buf("prev_grad", len(data))
+		step := st.BufFill("step_size", len(data), grp.LR)
 		for i := range data {
 			g := grad[i]
 			signProd := prev[i] * g
@@ -108,7 +93,7 @@ func (r *Rprop) Step() {
 				prev[i] = 0
 			}
 		}
-	}
+	})
 }
 
 func sign(x float64) float64 {
@@ -120,16 +105,3 @@ func sign(x float64) float64 {
 	}
 	return 0
 }
-
-// ZeroGrad zeros the gradients of all parameters.
-func (r *Rprop) ZeroGrad() { zeroGradAll(r.params) }
-
-// Parameters returns the parameter list.
-func (r *Rprop) Parameters() []*tensor.Tensor { return r.params }
-
-// LR returns the base step size.
-func (r *Rprop) LR() float64 { return r.lr }
-
-// SetLR updates the base step size (does not retroactively rescale existing
-// per-element steps).
-func (r *Rprop) SetLR(lr float64) { r.lr = lr }

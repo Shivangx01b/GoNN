@@ -19,15 +19,10 @@ import (
 // Note: SparseAdam does not support weight decay (neither does PyTorch's), so
 // none is provided here.
 type SparseAdam struct {
-	params []*tensor.Tensor
-	lr     float64
-	beta1  float64
-	beta2  float64
-	eps    float64
-
-	m    map[*tensor.Tensor][]float64
-	v    map[*tensor.Tensor][]float64
-	step map[*tensor.Tensor][]int // per-entry update count
+	baseOptimizer
+	beta1 float64
+	beta2 float64
+	eps   float64
 }
 
 // SparseAdamOption configures a SparseAdam optimizer.
@@ -43,17 +38,19 @@ func WithSparseAdamBeta2(b float64) SparseAdamOption { return func(s *SparseAdam
 func WithSparseAdamEps(e float64) SparseAdamOption { return func(s *SparseAdam) { s.eps = e } }
 
 // NewSparseAdam constructs a SparseAdam optimizer with defaults beta1=0.9,
-// beta2=0.999, eps=1e-8.
+// beta2=0.999, eps=1e-8. Group.WeightDecay is ignored by SparseAdam.
 func NewSparseAdam(params []*tensor.Tensor, lr float64, opts ...SparseAdamOption) *SparseAdam {
+	return NewSparseAdamGroups(singleGroup(params, lr), opts...)
+}
+
+// NewSparseAdamGroups constructs a SparseAdam optimizer over explicit
+// parameter groups. Group.WeightDecay is ignored by SparseAdam.
+func NewSparseAdamGroups(groups []Group, opts ...SparseAdamOption) *SparseAdam {
 	s := &SparseAdam{
-		params: params,
-		lr:     lr,
-		beta1:  0.9,
-		beta2:  0.999,
-		eps:    1e-8,
-		m:      make(map[*tensor.Tensor][]float64),
-		v:      make(map[*tensor.Tensor][]float64),
-		step:   make(map[*tensor.Tensor][]int),
+		baseOptimizer: newBase(groups),
+		beta1:         0.9,
+		beta2:         0.999,
+		eps:           1e-8,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -63,53 +60,24 @@ func NewSparseAdam(params []*tensor.Tensor, lr float64, opts ...SparseAdamOption
 
 // Step performs a single SparseAdam update, touching only nonzero-grad entries.
 func (s *SparseAdam) Step() {
-	for _, p := range s.params {
-		if p == nil || p.Grad == nil {
-			continue
-		}
-		grad := p.Grad.Data
-		data := p.Data
-		m := s.m[p]
-		if m == nil {
-			m = make([]float64, len(data))
-			s.m[p] = m
-		}
-		v := s.v[p]
-		if v == nil {
-			v = make([]float64, len(data))
-			s.v[p] = v
-		}
-		cnt := s.step[p]
-		if cnt == nil {
-			cnt = make([]int, len(data))
-			s.step[p] = cnt
-		}
+	s.forEachParam(func(grp *Group, p *tensor.Tensor, data, grad []float64, st *State) {
+		m := st.Buf("m", len(data))
+		v := st.Buf("v", len(data))
+		cnt := st.Buf("step", len(data))
 		for i := range data {
 			g := grad[i]
 			if g == 0 {
 				continue
 			}
 			cnt[i]++
-			t := float64(cnt[i])
+			t := cnt[i]
 			bc1 := 1 - math.Pow(s.beta1, t)
 			bc2 := 1 - math.Pow(s.beta2, t)
 			m[i] = s.beta1*m[i] + (1-s.beta1)*g
 			v[i] = s.beta2*v[i] + (1-s.beta2)*g*g
 			mHat := m[i] / bc1
 			vHat := v[i] / bc2
-			data[i] -= s.lr * mHat / (math.Sqrt(vHat) + s.eps)
+			data[i] -= grp.LR * mHat / (math.Sqrt(vHat) + s.eps)
 		}
-	}
+	})
 }
-
-// ZeroGrad zeros the gradients of all parameters.
-func (s *SparseAdam) ZeroGrad() { zeroGradAll(s.params) }
-
-// Parameters returns the parameter list.
-func (s *SparseAdam) Parameters() []*tensor.Tensor { return s.params }
-
-// LR returns the current learning rate.
-func (s *SparseAdam) LR() float64 { return s.lr }
-
-// SetLR updates the learning rate.
-func (s *SparseAdam) SetLR(lr float64) { s.lr = lr }
