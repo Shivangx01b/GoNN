@@ -134,24 +134,34 @@ func FunctionalCall(m Module, x *tensor.Tensor, replace map[string]*tensor.Tenso
 	return y
 }
 
-// FunctionalCallGrad is the safe gradient-taking variant of FunctionalCall:
-// it runs forward (through nn.Call) AND backward entirely inside the swap
-// window, so the backward pass sees the replacement data it needs. It
-// returns the scalar loss value and deep copies of the gradients of ALL of
-// m's named parameters — computed w.r.t. the replaced values for swapped
-// parameters and the module's own values for the rest — keyed by dotted
-// name. Parameters that received no gradient are omitted from the map.
-//
-// The module is left exactly as found: parameter Data, and every parameter's
-// Grad pointer (including pre-existing gradients), are restored before
-// returning; the gradients accumulated during the call live only in the
-// returned map.
-//
-// loss must map the module output to a scalar tensor (e.g. mean-squared
-// error against a captured target).
-func FunctionalCallGrad(m Module, x *tensor.Tensor, replace map[string]*tensor.Tensor,
-	loss func(y *tensor.Tensor) *tensor.Tensor) (lossVal float64, grads map[string][]float64) {
+// FunctionalCallOpt configures the gradient-taking functional calls.
+type FunctionalCallOpt func(*fcOpts)
 
+type fcOpts struct {
+	gradsToReplacements bool
+}
+
+// WithGradsToReplacements makes FunctionalCallGrad(Multi) additionally
+// ACCUMULATE each swapped name's gradient into the corresponding replacement
+// tensor's .Grad (allocated if nil) — giving PyTorch functional_call
+// semantics, where gradients w.r.t. the supplied parameters live on the
+// supplied tensors. The returned map is unchanged; the module's own
+// parameters still end the call with their original Grad pointers.
+func WithGradsToReplacements() FunctionalCallOpt {
+	return func(o *fcOpts) { o.gradsToReplacements = true }
+}
+
+// functionalGrad is the shared core of FunctionalCallGrad/-Multi: it runs
+// compute() (which must build the graph and return a SCALAR loss) inside the
+// swap window with every parameter's pre-existing Grad parked, backwards it,
+// and harvests copies of the gradients by dotted name.
+func functionalGrad(m Child, replace map[string]*tensor.Tensor,
+	compute func() *tensor.Tensor, opts []FunctionalCallOpt) (lossVal float64, grads map[string][]float64) {
+
+	var o fcOpts
+	for _, fn := range opts {
+		fn(&o)
+	}
 	grads = make(map[string][]float64)
 	WithReplacedParams(m, replace, func() {
 		// Park every parameter's current Grad and accumulate into fresh ones,
@@ -171,7 +181,7 @@ func FunctionalCallGrad(m Module, x *tensor.Tensor, replace map[string]*tensor.T
 			}
 		}()
 
-		l := loss(Call(m, x))
+		l := compute()
 		lossVal = l.Item() // also validates the loss is scalar
 		l.Backward()
 		for _, p := range params {
@@ -180,5 +190,68 @@ func FunctionalCallGrad(m Module, x *tensor.Tensor, replace map[string]*tensor.T
 			}
 		}
 	})
+	if o.gradsToReplacements {
+		for name, r := range replace {
+			g, ok := grads[name]
+			if !ok {
+				continue
+			}
+			if r.Grad == nil {
+				r.Grad = tensor.Zeros(r.Shape...)
+			}
+			for i := range g {
+				r.Grad.Data[i] += g[i]
+			}
+		}
+	}
 	return lossVal, grads
+}
+
+// FunctionalCallGrad is the safe gradient-taking variant of FunctionalCall:
+// it runs forward (through nn.Call) AND backward entirely inside the swap
+// window, so the backward pass sees the replacement data it needs. It
+// returns the scalar loss value and deep copies of the gradients of ALL of
+// m's named parameters — computed w.r.t. the replaced values for swapped
+// parameters and the module's own values for the rest — keyed by dotted
+// name. Parameters that received no gradient are omitted from the map.
+// With WithGradsToReplacements, the swapped names' gradients are also
+// accumulated into the replacement tensors' .Grad (PyTorch semantics).
+//
+// The module is left exactly as found: parameter Data, and every parameter's
+// Grad pointer (including pre-existing gradients), are restored before
+// returning; the gradients accumulated during the call live only in the
+// returned map (and, optionally, on the replacements).
+//
+// loss must map the module output to a scalar tensor (e.g. mean-squared
+// error against a captured target).
+func FunctionalCallGrad(m Module, x *tensor.Tensor, replace map[string]*tensor.Tensor,
+	loss func(y *tensor.Tensor) *tensor.Tensor, opts ...FunctionalCallOpt) (lossVal float64, grads map[string][]float64) {
+
+	return functionalGrad(m, replace, func() *tensor.Tensor { return loss(Call(m, x)) }, opts)
+}
+
+// FunctionalCallMulti is FunctionalCall for modules whose Forward takes more
+// than one input (MultiHeadAttention, Bilinear, Seq2Seq, ...): the caller
+// closes over the inputs and invokes the module inside forward. Hooks do NOT
+// fire automatically (the module is invoked by the closure, not by nn.Call —
+// wrap with nn.Call inside the closure for single-input children if needed).
+// The same sharp edges as FunctionalCall apply: do not Backward the returned
+// tensor after the call has returned — use FunctionalCallGradMulti.
+func FunctionalCallMulti(m Child, replace map[string]*tensor.Tensor,
+	forward func() *tensor.Tensor) *tensor.Tensor {
+
+	var y *tensor.Tensor
+	WithReplacedParams(m, replace, func() { y = forward() })
+	return y
+}
+
+// FunctionalCallGradMulti is FunctionalCallGrad for multi-input modules: run
+// must build the full graph — module invocation AND loss — and return the
+// scalar loss tensor. Forward and backward both happen inside the swap
+// window; gradients are returned by dotted name (and accumulated onto the
+// replacements with WithGradsToReplacements).
+func FunctionalCallGradMulti(m Child, replace map[string]*tensor.Tensor,
+	run func() *tensor.Tensor, opts ...FunctionalCallOpt) (lossVal float64, grads map[string][]float64) {
+
+	return functionalGrad(m, replace, run, opts)
 }

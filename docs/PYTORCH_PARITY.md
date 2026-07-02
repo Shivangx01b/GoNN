@@ -77,7 +77,7 @@ Other: `Softmin`/`Softmax`/`Softmax2d`/`LogSoftmax` ✅,
 |---|---|---|
 | RNN / LSTM / GRU | ✅ | multi-layer + bidirectional; `WithReLU()`; `WithRNNDropout(p)` (inter-layer); LSTM `WithProjSize(p)`; `ForwardWithState(h0…) → (seq, hN[, cN])` in PyTorch `(L·D, B, H)` layout |
 | RNNCell / LSTMCell / GRUCell | ✅ | LSTMCell supports projection |
-| utils.rnn pack/pad | 🟡 `PackedSequence`, `Pack(Padded)Sequence`, `PadPackedSequence`, `ForwardPacked` | padded storage (semantics-exact, no compute savings); per-sequence outputs/states proven bit-equal to individual runs; bidirectional packed input panics (documented) |
+| utils.rnn pack/pad | ✅ `PackedSequence`, `Pack(Padded)Sequence`, `PadPackedSequence`, `ForwardPacked` | padded storage (semantics-exact, no compute savings); unidirectional AND bidirectional (per-sequence time reversal via differentiable Gather); per-sequence outputs/states proven bit-equal to individual runs incl. multi-layer bidir + proj |
 
 ## Transformer
 
@@ -135,8 +135,8 @@ verified against brute-force alignment enumeration; mean divides by
 | fuse_conv_bn_eval / fuse_linear_bn_eval | ✅ `nn.FuseConvBNEval` / `FuseLinearBNEval` | equivalence verified to 1e-12 |
 | weight_norm / spectral_norm | 🟡 `nn.WeightNormLinear/Conv2d`, `nn.SpectralNormLinear/Conv2d` | explicit wrapper modules (no hooks); power-iteration buffers update in train mode; `Remove*` bakes weights back |
 | prune.* | 🟡 `nn/prune` | mask registry + `Reapply` after optimizer steps replaces the forward pre-hook; Random/L1 unstructured, Ln/Random structured, global, custom-mask, remove/is-pruned |
-| parametrize.* | 🟡 `nn.Parametrization` + `ParametrizedLinear/Conv2d` | generic function-of-weight wrappers with chaining (`AddParametrization`) and `RemoveParametrizations`; no `right_inverse`/`cached` |
-| stateless.functional_call | 🟡 `nn.FunctionalCall` / `FunctionalCallGrad` | temporary param-data swap; gradients land on module params (use `FunctionalCallGrad` for grads-by-name — sharp edges documented) |
+| parametrize.* | ✅ `nn.Parametrization` (+`ParametrizationWithInverse`), `ParametrizedLinear/Conv2d` | chaining with effective-weight preservation, `right_inverse` init (function-preserving wrap), `SetEffectiveWeight` assignment, `Cached()` windows (parametrize.cached analog, gradient contract documented), grouped convs, `RemoveParametrizations` |
+| stateless.functional_call | ✅ `nn.FunctionalCall(Grad)(Multi)` | swap-window call; `WithGradsToReplacements()` puts gradients on the supplied tensors (PyTorch semantics); buffer replacement; multi-input variants |
 | skip_init | ❌ | intentionally N/A: no meta device; constructor init cost is negligible in Go |
 
 ## Quantization
@@ -161,9 +161,7 @@ optimizer (`Parameters()` is empty pre-initialization — documented loudly).
 ## Known remaining gaps (complete list)
 
 Hooks on bare `Forward` calls (Go has no `__call__` — use `nn.Call` or
-containers) · `skip_init` (N/A — no meta device) · bidirectional
-`ForwardPacked` (padded storage can't reproduce the packed reverse pass —
-panics with guidance) · `Embedding` `scale_grad_by_freq`/`sparse` gradients ·
-quantized conv / fx-graph quantization · `parametrize` `right_inverse`/
-`cached` · `FractionalMaxPool` per-(n,c) random samples (one draw per dim,
-broadcast).
+containers) · `skip_init` (N/A — no meta device) · `Embedding`
+`scale_grad_by_freq`/`sparse` gradients · quantized conv / fx-graph
+quantization · `FractionalMaxPool` per-(n,c) random samples (one draw per
+dim, broadcast).

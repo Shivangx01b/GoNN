@@ -211,6 +211,12 @@ func newConv2dLike(c *Conv2d, bias bool) *Conv2d {
 		WithKernel(c.Kernel...), WithStride(c.Stride...),
 		WithPad(c.Pad...), WithDilation(c.Dilation...),
 	}
+	if c.Groups > 1 {
+		opts = append(opts, WithGroups(c.Groups))
+	}
+	if c.PaddingMode != "" && c.PaddingMode != "zeros" {
+		opts = append(opts, WithPaddingMode(c.PaddingMode))
+	}
 	if !bias {
 		opts = append(opts, WithNoBias())
 	}

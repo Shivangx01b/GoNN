@@ -196,10 +196,13 @@ func TestRemoveParametrizationsConv2d(t *testing.T) {
 	}
 }
 
-func TestParametrizedConv2dGroupsPanics(t *testing.T) {
-	mustPanic(t, "grouped conv", func() {
-		NewParametrizedConv2d(NewConv2d(4, 4, 3, WithGroups(2)), softplusParam)
-	})
+// Grouped convolutions are supported since the right_inverse/cached upgrade;
+// TestParametrizedConv2dGrouped (parametrize_finish_test.go) covers them.
+func TestParametrizedConv2dGroupsConstructs(t *testing.T) {
+	m := NewParametrizedConv2d(NewConv2d(4, 4, 3, WithGroups(2)), softplusParam)
+	if m == nil || !IsParametrized(m) {
+		t.Fatal("grouped ParametrizedConv2d should construct")
+	}
 }
 
 // ---- generic helpers ----------------------------------------------------------
