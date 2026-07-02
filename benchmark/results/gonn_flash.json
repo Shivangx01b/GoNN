@@ -8,8 +8,8 @@
     "seq": 512,
     "head_dim": 64,
     "causal": false,
-    "ms_per_iter": 43.385782877604164,
-    "gflops": 98.99480915479968,
+    "ms_per_iter": 46.14956461588542,
+    "gflops": 93.06625819220847,
     "iters": 30,
     "transfer": "device-resident"
   },
@@ -22,8 +22,8 @@
     "seq": 1024,
     "head_dim": 64,
     "causal": false,
-    "ms_per_iter": 86.70201822916667,
-    "gflops": 99.07421727249178,
+    "ms_per_iter": 92.80450846354167,
+    "gflops": 92.55945356765253,
     "iters": 30,
     "transfer": "device-resident"
   },
@@ -36,8 +36,8 @@
     "seq": 2048,
     "head_dim": 64,
     "causal": false,
-    "ms_per_iter": 172.982275390625,
-    "gflops": 99.31577755700563,
+    "ms_per_iter": 181.668505859375,
+    "gflops": 94.56712985407886,
     "iters": 30,
     "transfer": "device-resident"
   },
@@ -50,8 +50,8 @@
     "seq": 512,
     "head_dim": 64,
     "causal": true,
-    "ms_per_iter": 24.178955078125,
-    "gflops": 88.81623052200693,
+    "ms_per_iter": 25.613651529947916,
+    "gflops": 83.84137050857922,
     "iters": 30,
     "transfer": "device-resident"
   },
@@ -64,8 +64,8 @@
     "seq": 1024,
     "head_dim": 64,
     "causal": true,
-    "ms_per_iter": 46.9401611328125,
-    "gflops": 91.49877615136043,
+    "ms_per_iter": 49.98123372395833,
+    "gflops": 85.93159824186618,
     "iters": 30,
     "transfer": "device-resident"
   },
@@ -78,8 +78,8 @@
     "seq": 2048,
     "head_dim": 64,
     "causal": true,
-    "ms_per_iter": 91.81822102864584,
-    "gflops": 93.55370312957899,
+    "ms_per_iter": 97.63857421875,
+    "gflops": 87.97685403265992,
     "iters": 30,
     "transfer": "device-resident"
   }

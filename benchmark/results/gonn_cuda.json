@@ -5,8 +5,8 @@
     "dtype": "float64",
     "op": "matmul",
     "size": 256,
-    "ms_per_iter": 0.657384,
-    "gflops": 51.04236184634856,
+    "ms_per_iter": 0.641329,
+    "gflops": 52.320153930353996,
     "iters": 20,
     "transfer": "per-call-h2d-d2h"
   },
@@ -16,8 +16,8 @@
     "dtype": "float64",
     "op": "matmul",
     "size": 512,
-    "ms_per_iter": 2.679218,
-    "gflops": 100.19171862834604,
+    "ms_per_iter": 2.701534,
+    "gflops": 99.36408573795481,
     "iters": 20,
     "transfer": "per-call-h2d-d2h"
   },
@@ -27,8 +27,8 @@
     "dtype": "float64",
     "op": "matmul",
     "size": 1024,
-    "ms_per_iter": 16.873029,
-    "gflops": 127.27315575644423,
+    "ms_per_iter": 17.884883,
+    "gflops": 120.07255781321021,
     "iters": 20,
     "transfer": "per-call-h2d-d2h"
   },
@@ -38,8 +38,8 @@
     "dtype": "float64",
     "op": "matmul",
     "size": 2048,
-    "ms_per_iter": 111.727905,
-    "gflops": 153.7652494602848,
+    "ms_per_iter": 118.102218,
+    "gflops": 145.46610110235187,
     "iters": 20,
     "transfer": "per-call-h2d-d2h"
   },
@@ -49,7 +49,7 @@
     "dtype": "float64",
     "op": "elementwise_add",
     "size": 1000000,
-    "ms_per_iter": 2.245551,
+    "ms_per_iter": 2.474468,
     "gflops": null,
     "iters": 50,
     "transfer": "per-call-h2d-d2h"
@@ -60,7 +60,7 @@
     "dtype": "float64",
     "op": "relu",
     "size": 1000000,
-    "ms_per_iter": 1.593528,
+    "ms_per_iter": 1.679368,
     "gflops": null,
     "iters": 50,
     "transfer": "per-call-h2d-d2h"
@@ -71,7 +71,7 @@
     "dtype": "float64",
     "op": "elementwise_add",
     "size": 10000000,
-    "ms_per_iter": 24.587369,
+    "ms_per_iter": 28.091733,
     "gflops": null,
     "iters": 50,
     "transfer": "per-call-h2d-d2h"
@@ -82,7 +82,7 @@
     "dtype": "float64",
     "op": "relu",
     "size": 10000000,
-    "ms_per_iter": 16.097859,
+    "ms_per_iter": 17.901625,
     "gflops": null,
     "iters": 50,
     "transfer": "per-call-h2d-d2h"

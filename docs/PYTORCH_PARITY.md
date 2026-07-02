@@ -22,7 +22,7 @@ means the op lowers to the backend GEMM/kernel dispatch on `-tags cuda` builds.
 
 | torch.nn | GoNN | Notes |
 |---|---|---|
-| Conv1d/2d/3d | ✅ | options: `WithStride/WithPad/WithDilation/WithKernel/WithGroups/WithNoBias`; `padding_mode` ❌ (compose with padding layers) |
+| Conv1d/2d/3d | ✅ | options: `WithStride/WithPad/WithDilation/WithKernel/WithGroups/WithNoBias/WithPaddingMode` (zeros/reflect/replicate/circular — bitwise-equal to manual pre-padding) |
 | ConvTranspose1d/2d/3d | ✅ | + `WithOutputPadding` (must be < stride) |
 | LazyConv*/LazyConvTranspose* | ✅ `nn.LazyConv…` | run a dry forward before creating the optimizer |
 | Unfold / Fold | ✅ `nn.Unfold` / `nn.Fold` | `Fold(Unfold(x)) == x · divisor` identity tested |
@@ -31,7 +31,8 @@ means the op lowers to the backend GEMM/kernel dispatch on `-tags cuda` builds.
 
 | torch.nn | GoNN | Notes |
 |---|---|---|
-| MaxPool1d/2d/3d | ✅ | + `ForwardWithIndices` (PyTorch flat-index convention); pool `padding`/`dilation`/`ceil_mode` ❌ |
+| MaxPool1d/2d/3d | ✅ | + `ForwardWithIndices` (PyTorch flat-index convention), `WithPoolPadding` (−1e300 sentinel, not −Inf — documented), `WithPoolDilation`, `WithPoolCeilMode` (ATen output-clip rule) |
+| AvgPool options | ✅ | `WithPoolPadding`, `WithPoolCeilMode` with ATen-exact divisor rules, `WithCountIncludePad(false)` |
 | MaxUnpool1d/2d/3d | ✅ | differentiable scatter via `MakeNode` |
 | AvgPool1d/2d/3d | ✅ | |
 | FractionalMaxPool2d/3d | ✅ | PyTorch `generate_intervals` formula; 🟡 one random u per dim per forward (broadcast `_random_samples`); injectable for determinism |
@@ -51,7 +52,8 @@ All 25 weighted-sum activations ✅ (`ReLU`…`GLU`), including: `GELU` tanh
 **and** exact-erf (`GELUExact()`, `GELUApprox("none"|"tanh")` — with its own
 CUDA/OpenCL kernel), `Softplus` with β/threshold (`SoftplusWith`), learnable
 `PReLU`, `MultiheadAttention` with additive attention masks, key-padding
-masks, and attention dropout (`ForwardMasked`; `kdim`/`vdim` ❌).
+masks, attention dropout (`ForwardMasked`), and `WithKDim`/`WithVDim`
+projections.
 🟡 `RReLU`: training mode samples one slope per forward (whole-tensor, not
 per-element); eval = midpoint, PyTorch-exact.
 
@@ -67,15 +69,15 @@ Other: `Softmin`/`Softmax`/`Softmax2d`/`LogSoftmax` ✅,
 | GroupNorm / LayerNorm / RMSNorm | ✅ | `WithEps/WithMomentum/WithAffine` |
 | InstanceNorm1d/2d/3d (+Lazy) | ✅ | affine off by default (PyTorch parity) |
 | LocalResponseNorm | ✅ | exact ATen window semantics |
-| SyncBatchNorm | ❌ | BN-stat sync across ranks not implemented — use GroupNorm with DDP (documented in `distributed`) |
+| SyncBatchNorm | ✅ `distributed.NewSyncBatchNorm1d/2d/3d` | **exact**: stats all-reduced in forward, reduction terms all-reduced inside backward (`MakeNode`); 2-rank split == full-batch BN in values (1e-12) and gradients (1e-10) — tested |
 
 ## Recurrent
 
 | torch.nn | GoNN | Notes |
 |---|---|---|
-| RNN / LSTM / GRU | ✅ | multi-layer + bidirectional; `WithReLU()` nonlinearity; `ForwardWithState(h0…) → (seq, hN[, cN])` in PyTorch `(L·D, B, H)` layout; inter-layer dropout ❌, `proj_size` ❌ |
-| RNNCell / LSTMCell / GRUCell | ✅ | |
-| utils.rnn pad_sequence / unpad_sequence | ✅ `nn.PadSequence`/`UnpadSequence` | `PackedSequence` ❌ — GoNN RNNs consume padded batches (documented) |
+| RNN / LSTM / GRU | ✅ | multi-layer + bidirectional; `WithReLU()`; `WithRNNDropout(p)` (inter-layer); LSTM `WithProjSize(p)`; `ForwardWithState(h0…) → (seq, hN[, cN])` in PyTorch `(L·D, B, H)` layout |
+| RNNCell / LSTMCell / GRUCell | ✅ | LSTMCell supports projection |
+| utils.rnn pack/pad | 🟡 `PackedSequence`, `Pack(Padded)Sequence`, `PadPackedSequence`, `ForwardPacked` | padded storage (semantics-exact, no compute savings); per-sequence outputs/states proven bit-equal to individual runs; bidirectional packed input panics (documented) |
 
 ## Transformer
 
@@ -91,8 +93,8 @@ Other: `Softmin`/`Softmax`/`Softmax2d`/`LogSoftmax` ✅,
 | Identity / Linear / Bilinear / LazyLinear | ✅ | |
 | Dropout, Dropout1d/2d/3d | ✅ | channel-wise variants zero whole channels |
 | AlphaDropout / FeatureAlphaDropout | ✅ | exact ATen α′/a/b constants; mean/var preservation tested |
-| Embedding | ✅ | IndexSelect + scatter-add backward; `padding_idx`/`max_norm` ❌ |
-| EmbeddingBag | ✅ | sum/mean/max; offsets semantics; empty bags = zeros |
+| Embedding | ✅ | IndexSelect + scatter-add backward; `WithPaddingIdx` (row zeroed, gradient excluded — exactly zero), `WithMaxNorm`/`WithNormType` (in-place renorm, non-differentiable like PyTorch); `scale_grad_by_freq`/`sparse` ❌ |
+| EmbeddingBag | ✅ | sum/mean/max; offsets semantics; empty bags = zeros; `WithBagPaddingIdx`/`WithBagMaxNorm` |
 | CosineSimilarity / PairwiseDistance | ✅ | |
 
 ## Losses — 21/21
@@ -112,7 +114,7 @@ verified against brute-force alignment enumeration; mean divides by
 | torch.nn | GoNN | Notes |
 |---|---|---|
 | PixelShuffle / PixelUnshuffle | ✅ | |
-| Upsample | ✅ | 3D/4D/5D; nearest/linear/bilinear/trilinear + `WithAlignCorners`; bicubic ❌ |
+| Upsample | ✅ | 3D/4D/5D; nearest/linear/bilinear/trilinear/**bicubic** (Keys a=−0.75, verified against PyTorch 2.7.1 float64 goldens at <1e-12) + `WithAlignCorners` |
 | UpsamplingNearest2d / UpsamplingBilinear2d | ✅ | bilinear alias uses align_corners=true per PyTorch |
 | ChannelShuffle | ✅ | |
 
@@ -133,17 +135,21 @@ verified against brute-force alignment enumeration; mean divides by
 | fuse_conv_bn_eval / fuse_linear_bn_eval | ✅ `nn.FuseConvBNEval` / `FuseLinearBNEval` | equivalence verified to 1e-12 |
 | weight_norm / spectral_norm | 🟡 `nn.WeightNormLinear/Conv2d`, `nn.SpectralNormLinear/Conv2d` | explicit wrapper modules (no hooks); power-iteration buffers update in train mode; `Remove*` bakes weights back |
 | prune.* | 🟡 `nn/prune` | mask registry + `Reapply` after optimizer steps replaces the forward pre-hook; Random/L1 unstructured, Ln/Random structured, global, custom-mask, remove/is-pruned |
-| parametrize.* | 🟡 | covered by the weight/spectral-norm wrappers; the generic register_parametrization framework ❌ |
-| skip_init / stateless.functional_call | ❌ | not meaningful without reflection-driven construction |
+| parametrize.* | 🟡 `nn.Parametrization` + `ParametrizedLinear/Conv2d` | generic function-of-weight wrappers with chaining (`AddParametrization`) and `RemoveParametrizations`; no `right_inverse`/`cached` |
+| stateless.functional_call | 🟡 `nn.FunctionalCall` / `FunctionalCallGrad` | temporary param-data swap; gradients land on module params (use `FunctionalCallGrad` for grads-by-name — sharp edges documented) |
+| skip_init | ❌ | intentionally N/A: no meta device; constructor init cost is negligible in Go |
 
 ## Quantization
 
-🟡 `quant` package: int8 per-tensor affine (`QTensor`, `Quantize`/`Dequantize`,
-`MinMaxObserver`) with **dynamic** and **static** quantized Linear
-(`NewDynamicLinearFrom`, `NewStaticLinearFrom`) — int8×int8→int32 GEMM with
-zero-point correction, ~1% relative error on well-scaled inputs (tested).
-CPU-only, inference-only (PyTorch eager quantization is likewise CPU).
-Fake-quant QAT, per-channel schemes, and quantized conv ❌.
+🟡 `quant` package: int8 per-tensor **and per-channel** affine (`QTensor`,
+`QTensorPerChannel`, `Quantize[PerChannel]`, observers incl.
+`MovingAverageMinMaxObserver`) with **dynamic** and **static** quantized
+Linear (`WithPerChannelWeights` option) — int8×int8→int32 GEMM with
+zero-point correction. **QAT**: `FakeQuant` (clamped straight-through
+gradients via `MakeNode`), `QATLinear` → `Convert()` → `StaticLinear`
+(converted output matches QAT eval to 1.4e-14; QAT beats naive PTQ ~10× on a
+bias-compensable fixture — tested). CPU-only, inference-only (PyTorch eager
+quantization is likewise CPU). Quantized conv ❌.
 
 ## Lazy modules
 
@@ -154,8 +160,10 @@ optimizer (`Parameters()` is empty pre-initialization — documented loudly).
 
 ## Known remaining gaps (complete list)
 
-`padding_mode` on convs · pool `padding`/`ceil_mode`/`dilation` · MHA
-`kdim`/`vdim` · RNN inter-layer dropout, `proj_size`, `PackedSequence` ·
-`SyncBatchNorm` · bicubic upsampling · `Embedding` `padding_idx`/`max_norm` ·
-generic `register_parametrization` · QAT/per-channel quantization ·
-`skip_init`/`stateless` · hooks on bare `Forward` calls.
+Hooks on bare `Forward` calls (Go has no `__call__` — use `nn.Call` or
+containers) · `skip_init` (N/A — no meta device) · bidirectional
+`ForwardPacked` (padded storage can't reproduce the packed reverse pass —
+panics with guidance) · `Embedding` `scale_grad_by_freq`/`sparse` gradients ·
+quantized conv / fx-graph quantization · `parametrize` `right_inverse`/
+`cached` · `FractionalMaxPool` per-(n,c) random samples (one draw per dim,
+broadcast).
