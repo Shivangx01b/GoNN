@@ -210,6 +210,51 @@ func packedOutputMask(B, T int, lengths []int) *tensor.Tensor {
 	return m
 }
 
+// reverseValidPrefix applies the per-sequence time reversal R to a
+// batch-first padded tensor x (B, T, F):
+//
+//	R(x)[b, t] = x[b, lengths[b]-1-t]  for t <  lengths[b]
+//	R(x)[b, t] = x[b, t]               for t >= lengths[b]  (identity)
+//
+// R is an involution on the valid region: applying it twice restores every
+// valid timestep, and padded positions are left in place. It is the exact
+// packed-reverse primitive: running a reverse-direction cell over each
+// sequence's own valid steps (PyTorch's packed reverse pass) equals running
+// it FORWARD over R(x), and re-applying R to the forward-run outputs puts
+// each reverse output back at its original timestep. Callers with time-first
+// data must permute to batch-first first (as ForwardPacked already does via
+// batchFirstPadded).
+//
+// Implemented as a single tensor.Gather along the time axis with a full-rank
+// constant index tensor (idx[b, t, f] = lengths[b]-1-t when t < lengths[b],
+// else t), so it is differentiable via Gather's scatter-add backward.
+func reverseValidPrefix(x *tensor.Tensor, lengths []int) *tensor.Tensor {
+	if len(x.Shape) != 3 {
+		panic(fmt.Sprintf("reverseValidPrefix: x must be (B, T, F), got shape %v", x.Shape))
+	}
+	B, T, F := x.Shape[0], x.Shape[1], x.Shape[2]
+	if len(lengths) != B {
+		panic(fmt.Sprintf("reverseValidPrefix: %d lengths for batch of %d", len(lengths), B))
+	}
+	idx := tensor.Zeros(B, T, F)
+	for b, L := range lengths {
+		if L < 1 || L > T {
+			panic(fmt.Sprintf("reverseValidPrefix: lengths[%d]=%d out of range [1, %d]", b, L, T))
+		}
+		for t := 0; t < T; t++ {
+			src := t
+			if t < L {
+				src = L - 1 - t
+			}
+			base := (b*T + t) * F
+			for f := 0; f < F; f++ {
+				idx.Data[base+f] = float64(src)
+			}
+		}
+	}
+	return x.Gather(1, idx)
+}
+
 // gatherLastSteps picks out[b, lengths[b]-1, :] for every batch element of a
 // (B, T, H) tensor, returning (B, H). Differentiable via IndexSelect.
 func gatherLastSteps(out *tensor.Tensor, lengths []int) *tensor.Tensor {

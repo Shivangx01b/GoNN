@@ -710,21 +710,33 @@ func (g *GRU) ForwardWithState(x, h0 *tensor.Tensor) (*tensor.Tensor, *tensor.Te
 // lengths, so ForwardPacked runs the ordinary padded forward and then
 // (a) zeroes the outputs at t >= length_i (differentiable 0/1 mask) and
 // (b) gathers each sequence's final state at its true last step
-// t = length_i - 1 per layer. For a UNIDIRECTIONAL stack this is exactly
-// equivalent to PyTorch's packed evaluation: causality guarantees every
-// valid timestep never sees a padded step.
+// t = length_i - 1 per layer and direction. For the FORWARD direction this
+// is exactly equivalent to PyTorch's packed evaluation: causality guarantees
+// every valid timestep never sees a padded step.
 //
-// Bidirectional stacks PANIC: PyTorch's packed reverse pass starts at each
-// sequence's own last element, which padded evaluation cannot reproduce (the
-// reverse cell here would start at t = Tmax-1, i.e. inside the padding).
-// Use fixed-length batches (Forward/ForwardWithState) for bidirectional
-// stacks.
-
-// packedBidirMsg explains the bidirectional ForwardPacked panic.
-const packedBidirMsg = "bidirectional packed input is not supported: with padded storage the " +
-	"reverse direction would start at t = Tmax-1 (inside the padding) instead of each " +
-	"sequence's own last element, so it cannot match PyTorch's packed reverse pass; " +
-	"use fixed-length batches (Forward/ForwardWithState) for bidirectional stacks"
+// The REVERSE direction is made exact via per-sequence time reversal
+// (reverseValidPrefix). Let R be the involution R(x)[b, t] = x[b, len_b-1-t]
+// for t < len_b and R(x)[b, t] = x[b, t] for t >= len_b. PyTorch's packed
+// reverse pass runs the reverse cell over each sequence's own last-to-first
+// valid elements; that is identical to running the same cell FORWARD over
+// R(x): at forward step t < len_b the cell has consumed R(x)[b, 0..t] =
+// x[b, len_b-1], ..., x[b, len_b-1-t] — exactly the suffix the packed
+// reverse pass consumes when emitting the output for original time
+// len_b-1-t. Re-applying R to the forward-run outputs therefore places every
+// valid reverse output back at its original timestep (revSeq[b, t] =
+// tmp[b, len_b-1-t] for t < len_b), and the reverse-direction final state is
+// the forward run's state at step len_b-1 — the same per-sequence gather the
+// forward direction uses.
+//
+// Why valid outputs are unaffected by padding: for t < len_b the forward
+// cell reads cur[b, 0..t] (all valid) and the reversed run reads
+// R(cur)[b, 0..t] (all images of valid entries), so every valid step of a
+// layer depends only on valid steps of the previous layer. Positions
+// t >= len_b of the reversed run ARE garbage (they mix in padding), but they
+// land back on t >= len_b after re-reversal and the concatenated layer
+// output is masked to zero there before the next layer, so the garbage never
+// propagates. Each sequence's trimmed output and final states are therefore
+// bit-identical to running the stack on that sequence alone.
 
 // packedResult re-wraps a masked batch-first output (B, T, H) in the caller's
 // layout with a fresh copy of lengths.
@@ -738,80 +750,114 @@ func packedResult(masked *tensor.Tensor, ps PackedSequence) PackedSequence {
 	return PackedSequence{Padded: out, Lengths: lengths, BatchFirst: ps.BatchFirst}
 }
 
-// ForwardPacked runs the stack over a PackedSequence (unidirectional only —
-// see the deviation note above; bidirectional stacks panic). It returns the
-// packed output — padded positions t >= length_i zeroed, layout matching
-// ps.BatchFirst — and hN of shape (numLayers, B, H) taken at each sequence's
-// true last step. Inter-layer dropout (WithRNNDropout) applies as in Forward;
-// hN is gathered from the pre-dropout layer outputs, PyTorch style.
+// ForwardPacked runs the stack over a PackedSequence. It returns the packed
+// output — padded positions t >= length_i zeroed, layout matching
+// ps.BatchFirst — and hN of shape (numLayers*numDirections, B, H) taken at
+// each sequence's true last step, indexed layer*numDirections + direction
+// (0 = forward, 1 = reverse), PyTorch style. Bidirectional stacks are exact:
+// the reverse direction runs the back cell forward over the per-sequence
+// time reversal of the layer input (see the deviation note above).
+// Inter-layer dropout (WithRNNDropout) applies as in Forward; hN is gathered
+// from the pre-dropout layer outputs, PyTorch style.
 func (r *RNN) ForwardPacked(ps PackedSequence) (PackedSequence, *tensor.Tensor) {
-	if r.Bidirectional {
-		panic("RNN.ForwardPacked: " + packedBidirMsg)
-	}
 	ps.checkAgainst("RNN.ForwardPacked")
 	x := ps.batchFirstPadded() // (B, T, F)
 	B, T := x.Shape[0], x.Shape[1]
-	finals := make([]*tensor.Tensor, r.NumLayers)
+	D := numDirections(r.Bidirectional)
+	mask := packedOutputMask(B, T, ps.Lengths)
+	finals := make([]*tensor.Tensor, r.NumLayers*D)
 	cur := x
 	last := x
 	for li := 0; li < r.NumLayers; li++ {
 		out, _ := runRNNDir(r.Cells[li], cur, false, nil)
-		finals[li] = gatherLastSteps(out, ps.Lengths)
+		finals[li*D] = gatherLastSteps(out, ps.Lengths)
+		if r.Bidirectional {
+			revIn := reverseValidPrefix(cur, ps.Lengths)
+			tmp, _ := runRNNDir(r.BackCells[li], revIn, false, nil)
+			finals[li*D+1] = gatherLastSteps(tmp, ps.Lengths)
+			out = tensor.Concat(2, out, reverseValidPrefix(tmp, ps.Lengths)).Mul(mask)
+		}
 		last = out
 		cur = applyInterLayerDropout(r.Dropouts, li, r.NumLayers, out)
 	}
-	masked := last.Mul(packedOutputMask(B, T, ps.Lengths))
+	masked := last
+	if !r.Bidirectional {
+		masked = last.Mul(mask)
+	}
 	return packedResult(masked, ps), stackStates(finals)
 }
 
-// ForwardPacked runs the LSTM stack over a PackedSequence (unidirectional
-// only — see the deviation note above; bidirectional stacks panic). It
-// returns the packed output (padded positions zeroed), hN of shape
-// (numLayers, B, hiddenOut) and cN of shape (numLayers, B, H), both taken at
-// each sequence's true last step. With WithProjSize the h states have feature
-// size proj while the c states keep the hidden size.
+// ForwardPacked runs the LSTM stack over a PackedSequence. It returns the
+// packed output (padded positions zeroed), hN of shape (numLayers*
+// numDirections, B, hiddenOut) and cN of shape (numLayers*numDirections, B,
+// H), both taken at each sequence's true last step and indexed
+// layer*numDirections + direction (0 = forward, 1 = reverse), PyTorch style.
+// Bidirectional stacks are exact: the reverse direction runs the back cell
+// forward over the per-sequence time reversal of the layer input (see the
+// deviation note above). With WithProjSize the h states have feature size
+// proj while the c states keep the hidden size.
 func (l *LSTM) ForwardPacked(ps PackedSequence) (PackedSequence, *tensor.Tensor, *tensor.Tensor) {
-	if l.Bidirectional {
-		panic("LSTM.ForwardPacked: " + packedBidirMsg)
-	}
 	ps.checkAgainst("LSTM.ForwardPacked")
 	x := ps.batchFirstPadded() // (B, T, F)
 	B, T := x.Shape[0], x.Shape[1]
-	finalH := make([]*tensor.Tensor, l.NumLayers)
-	finalC := make([]*tensor.Tensor, l.NumLayers)
+	D := numDirections(l.Bidirectional)
+	mask := packedOutputMask(B, T, ps.Lengths)
+	finalH := make([]*tensor.Tensor, l.NumLayers*D)
+	finalC := make([]*tensor.Tensor, l.NumLayers*D)
 	cur := x
 	last := x
 	for li := 0; li < l.NumLayers; li++ {
 		out, cs, _ := runLSTMDirC(l.Cells[li], cur, false, nil)
-		finalH[li] = gatherLastSteps(out, ps.Lengths)
-		finalC[li] = gatherLastSteps(cs, ps.Lengths)
+		finalH[li*D] = gatherLastSteps(out, ps.Lengths)
+		finalC[li*D] = gatherLastSteps(cs, ps.Lengths)
+		if l.Bidirectional {
+			revIn := reverseValidPrefix(cur, ps.Lengths)
+			tmp, tmpC, _ := runLSTMDirC(l.BackCells[li], revIn, false, nil)
+			finalH[li*D+1] = gatherLastSteps(tmp, ps.Lengths)
+			finalC[li*D+1] = gatherLastSteps(tmpC, ps.Lengths)
+			out = tensor.Concat(2, out, reverseValidPrefix(tmp, ps.Lengths)).Mul(mask)
+		}
 		last = out
 		cur = applyInterLayerDropout(l.Dropouts, li, l.NumLayers, out)
 	}
-	masked := last.Mul(packedOutputMask(B, T, ps.Lengths))
+	masked := last
+	if !l.Bidirectional {
+		masked = last.Mul(mask)
+	}
 	return packedResult(masked, ps), stackStates(finalH), stackStates(finalC)
 }
 
-// ForwardPacked runs the GRU stack over a PackedSequence (unidirectional only
-// — see the deviation note above; bidirectional stacks panic). It returns the
-// packed output (padded positions zeroed) and hN of shape (numLayers, B, H)
-// taken at each sequence's true last step.
+// ForwardPacked runs the GRU stack over a PackedSequence. It returns the
+// packed output (padded positions zeroed) and hN of shape
+// (numLayers*numDirections, B, H) taken at each sequence's true last step,
+// indexed layer*numDirections + direction (0 = forward, 1 = reverse),
+// PyTorch style. Bidirectional stacks are exact: the reverse direction runs
+// the back cell forward over the per-sequence time reversal of the layer
+// input (see the deviation note above).
 func (g *GRU) ForwardPacked(ps PackedSequence) (PackedSequence, *tensor.Tensor) {
-	if g.Bidirectional {
-		panic("GRU.ForwardPacked: " + packedBidirMsg)
-	}
 	ps.checkAgainst("GRU.ForwardPacked")
 	x := ps.batchFirstPadded() // (B, T, F)
 	B, T := x.Shape[0], x.Shape[1]
-	finals := make([]*tensor.Tensor, g.NumLayers)
+	D := numDirections(g.Bidirectional)
+	mask := packedOutputMask(B, T, ps.Lengths)
+	finals := make([]*tensor.Tensor, g.NumLayers*D)
 	cur := x
 	last := x
 	for li := 0; li < g.NumLayers; li++ {
 		out, _ := runGRUDir(g.Cells[li], cur, false, nil)
-		finals[li] = gatherLastSteps(out, ps.Lengths)
+		finals[li*D] = gatherLastSteps(out, ps.Lengths)
+		if g.Bidirectional {
+			revIn := reverseValidPrefix(cur, ps.Lengths)
+			tmp, _ := runGRUDir(g.BackCells[li], revIn, false, nil)
+			finals[li*D+1] = gatherLastSteps(tmp, ps.Lengths)
+			out = tensor.Concat(2, out, reverseValidPrefix(tmp, ps.Lengths)).Mul(mask)
+		}
 		last = out
 		cur = applyInterLayerDropout(g.Dropouts, li, g.NumLayers, out)
 	}
-	masked := last.Mul(packedOutputMask(B, T, ps.Lengths))
+	masked := last
+	if !g.Bidirectional {
+		masked = last.Mul(mask)
+	}
 	return packedResult(masked, ps), stackStates(finals)
 }

@@ -397,30 +397,252 @@ func TestForwardPackedGradFlow(t *testing.T) {
 	}
 }
 
-// Bidirectional packed input must panic with a clear message (padded storage
-// cannot reproduce PyTorch's packed reverse pass).
-func TestForwardPackedBidirectionalPanics(t *testing.T) {
-	ps := PackSequence([]*tensor.Tensor{seededRandn(781, 3, 2), seededRandn(782, 2, 2)})
+// ============================================================================
+// Bidirectional PackedSequence (per-sequence time reversal)
+// ============================================================================
 
-	mustPanicBidir := func(name string, f func()) {
+// reverseValidPrefix reverses each sequence's valid prefix along time and
+// leaves padding in place; it is an involution on the valid region and
+// gradients flow through it (Gather scatter-add backward).
+func TestReverseValidPrefix(t *testing.T) {
+	// x[b, t, 0] = 10*b + t so every position is identifiable.
+	const B, T = 2, 4
+	x := tensor.Zeros(B, T, 1)
+	for b := 0; b < B; b++ {
+		for tt := 0; tt < T; tt++ {
+			x.Data[b*T+tt] = float64(10*b + tt)
+		}
+	}
+	lengths := []int{3, 4}
+	x.SetRequiresGrad(true)
+	r := reverseValidPrefix(x, lengths)
+	want := []float64{
+		2, 1, 0, 3, // seq 0: first 3 reversed, padding at t=3 untouched
+		13, 12, 11, 10, // seq 1: full reversal (len == T)
+	}
+	for i, w := range want {
+		if r.Data[i] != w {
+			t.Fatalf("R(x).Data[%d] = %g, want %g", i, r.Data[i], w)
+		}
+	}
+	// Involution: R(R(x)) == x (padding maps to itself, valid region swaps back).
+	tensorsEqualExact(t, "R(R(x)) == x", reverseValidPrefix(r, lengths), x)
+	// Backward scatters every output position back to exactly one input slot.
+	r.Sum().Backward()
+	if x.Grad == nil {
+		t.Fatal("no gradient through reverseValidPrefix")
+	}
+	for i, g := range x.Grad.Data {
+		if g != 1 {
+			t.Fatalf("grad[%d] = %g, want 1", i, g)
+		}
+	}
+}
+
+// THE key bidirectional packed guarantee: for a batch with distinct lengths
+// (5, 3, 1 — including the length-1 edge case), each sequence's ForwardPacked
+// output trimmed to its length is BIT-EQUAL to running the same stack's plain
+// forward on that sequence alone (B=1, T=len_b); hN (and cN) match the
+// per-sequence ForwardWithState finals at every layer*numDirections+direction
+// index; outputs at t >= length are exactly zero.
+func TestForwardPackedBidirPerSequenceEquivalence(t *testing.T) {
+	const F, H = 3, 4
+	seqs := []*tensor.Tensor{
+		seededRandn(781, 5, F),
+		seededRandn(782, 3, F),
+		seededRandn(783, 1, F),
+	}
+	ps := PackSequence(seqs)
+	B, T := 3, 5
+
+	check := func(name string, LD, hOut int, outPS PackedSequence, hN *tensor.Tensor,
+		solo func(x *tensor.Tensor) (*tensor.Tensor, *tensor.Tensor)) {
 		t.Helper()
-		defer func() {
-			r := recover()
-			if r == nil {
-				t.Fatalf("%s: expected panic for bidirectional packed input", name)
+		padded := outPS.Padded
+		if padded.Shape[0] != B || padded.Shape[1] != T || padded.Shape[2] != 2*hOut {
+			t.Fatalf("%s: packed output shape %v want [%d %d %d]", name, padded.Shape, B, T, 2*hOut)
+		}
+		if hN.Shape[0] != LD || hN.Shape[1] != B || hN.Shape[2] != hOut {
+			t.Fatalf("%s: hN shape %v want [%d %d %d]", name, hN.Shape, LD, B, hOut)
+		}
+		for b, s := range seqs {
+			Lb := s.Shape[0]
+			soloOut, soloH := solo(s.Reshape(1, Lb, F)) // (1, Lb, 2*hOut), (LD, 1, hOut)
+			for tt := 0; tt < T; tt++ {
+				for j := 0; j < 2*hOut; j++ {
+					got := padded.Data[(b*T+tt)*2*hOut+j]
+					if tt < Lb {
+						want := soloOut.Data[tt*2*hOut+j]
+						if got != want {
+							t.Fatalf("%s: seq %d out[t=%d,j=%d]: got %.17g want %.17g", name, b, tt, j, got, want)
+						}
+					} else if got != 0 {
+						t.Fatalf("%s: seq %d out[t=%d,j=%d]: padded position not zeroed (%g)", name, b, tt, j, got)
+					}
+				}
 			}
-			msg, ok := r.(string)
-			if !ok || !strings.Contains(msg, "bidirectional packed input is not supported") {
-				t.Fatalf("%s: panic %v lacks the bidirectional explanation", name, r)
+			for ld := 0; ld < LD; ld++ {
+				for j := 0; j < hOut; j++ {
+					got := hN.Data[(ld*B+b)*hOut+j]
+					want := soloH.Data[ld*hOut+j]
+					if got != want {
+						t.Fatalf("%s: seq %d hN[ld=%d,j=%d]: got %.17g want %.17g", name, b, ld, j, got, want)
+					}
+				}
 			}
-		}()
-		f()
+		}
+	}
+	checkC := func(name string, LD int, cN *tensor.Tensor, soloCs []*tensor.Tensor) {
+		t.Helper()
+		if cN.Shape[0] != LD || cN.Shape[1] != B || cN.Shape[2] != H {
+			t.Fatalf("%s: cN shape %v want [%d %d %d]", name, cN.Shape, LD, B, H)
+		}
+		for b := range seqs {
+			soloC := soloCs[b] // (LD, 1, H)
+			for ld := 0; ld < LD; ld++ {
+				for j := 0; j < H; j++ {
+					got := cN.Data[(ld*B+b)*H+j]
+					want := soloC.Data[ld*H+j]
+					if got != want {
+						t.Fatalf("%s: seq %d cN[ld=%d,j=%d]: got %.17g want %.17g", name, b, ld, j, got, want)
+					}
+				}
+			}
+		}
 	}
 
-	r := NewRNN(2, 3, WithBidirectional())
-	mustPanicBidir("RNN", func() { r.ForwardPacked(ps) })
-	l := NewLSTM(2, 3, WithBidirectional())
-	mustPanicBidir("LSTM", func() { l.ForwardPacked(ps) })
+	t.Run("RNN", func(t *testing.T) {
+		r := NewRNN(F, H, WithBidirectional())
+		outPS, hN := r.ForwardPacked(ps)
+		check("RNN", 2, H, outPS, hN, func(x *tensor.Tensor) (*tensor.Tensor, *tensor.Tensor) {
+			return r.ForwardWithState(x, nil)
+		})
+	})
+
+	t.Run("GRU-2layer", func(t *testing.T) {
+		g := NewGRU(F, H, WithLayers(2), WithBidirectional())
+		outPS, hN := g.ForwardPacked(ps)
+		check("GRU-2layer", 4, H, outPS, hN, func(x *tensor.Tensor) (*tensor.Tensor, *tensor.Tensor) {
+			return g.ForwardWithState(x, nil)
+		})
+	})
+
+	t.Run("LSTM-2layer", func(t *testing.T) {
+		l := NewLSTM(F, H, WithLayers(2), WithBidirectional())
+		outPS, hN, cN := l.ForwardPacked(ps)
+		var soloCs []*tensor.Tensor
+		check("LSTM-2layer", 4, H, outPS, hN, func(x *tensor.Tensor) (*tensor.Tensor, *tensor.Tensor) {
+			out, h, c := l.ForwardWithState(x, nil, nil)
+			soloCs = append(soloCs, c)
+			return out, h
+		})
+		checkC("LSTM-2layer", 4, cN, soloCs)
+	})
+
+	t.Run("LSTM-proj", func(t *testing.T) {
+		const P = 2
+		l := NewLSTM(F, H, WithBidirectional(), WithProjSize(P))
+		outPS, hN, cN := l.ForwardPacked(ps)
+		var soloCs []*tensor.Tensor
+		check("LSTM-proj", 2, P, outPS, hN, func(x *tensor.Tensor) (*tensor.Tensor, *tensor.Tensor) {
+			out, h, c := l.ForwardWithState(x, nil, nil)
+			soloCs = append(soloCs, c)
+			return out, h
+		})
+		checkC("LSTM-proj", 2, cN, soloCs)
+	})
+}
+
+// A time-first bidirectional PackedSequence must round-trip through
+// ForwardPacked in the time-first layout and match the batch-first result
+// exactly.
+func TestForwardPackedBidirTimeFirstLayout(t *testing.T) {
+	seqs := []*tensor.Tensor{seededRandn(784, 3, 2), seededRandn(785, 2, 2)}
+	bf := PackSequence(seqs)                                                // (B, T, F)
+	tf := PackPaddedSequence(bf.Padded.Permute(1, 0, 2), bf.Lengths, false) // (T, B, F)
+
 	g := NewGRU(2, 3, WithBidirectional())
-	mustPanicBidir("GRU", func() { g.ForwardPacked(ps) })
+	outBF, hBF := g.ForwardPacked(bf)
+	outTF, hTF := g.ForwardPacked(tf)
+	if outTF.BatchFirst {
+		t.Fatal("time-first input must produce time-first output")
+	}
+	tensorsEqualExact(t, "layouts agree", outBF.Padded, outTF.Padded.Permute(1, 0, 2))
+	tensorsEqualExact(t, "hN agrees", hBF, hTF)
+}
+
+// A same-length batch (no padding anywhere) must equal the plain fixed-length
+// bidirectional evaluation exactly: R is then the full time reversal, so the
+// packed reverse run is the standard reverse pass.
+func TestForwardPackedBidirFullLengthEqualsForward(t *testing.T) {
+	const B, T, F, H = 2, 4, 3, 4
+	x := seededRandn(786, B, T, F)
+	ps := PackPaddedSequence(x, []int{T, T}, true)
+
+	r := NewRNN(F, H, WithBidirectional())
+	outR, hR := r.ForwardPacked(ps)
+	wantR, wantHR := r.ForwardWithState(x, nil)
+	tensorsEqualExact(t, "RNN out == Forward", outR.Padded, r.Forward(x))
+	tensorsEqualExact(t, "RNN out == ForwardWithState", outR.Padded, wantR)
+	tensorsEqualExact(t, "RNN hN", hR, wantHR)
+
+	g := NewGRU(F, H, WithLayers(2), WithBidirectional())
+	outG, hG := g.ForwardPacked(ps)
+	wantG, wantHG := g.ForwardWithState(x, nil)
+	tensorsEqualExact(t, "GRU out", outG.Padded, wantG)
+	tensorsEqualExact(t, "GRU hN", hG, wantHG)
+
+	l := NewLSTM(F, H, WithBidirectional())
+	outL, hL, cL := l.ForwardPacked(ps)
+	wantL, wantHL, wantCL := l.ForwardWithState(x, nil, nil)
+	tensorsEqualExact(t, "LSTM out", outL.Padded, wantL)
+	tensorsEqualExact(t, "LSTM hN", hL, wantHL)
+	tensorsEqualExact(t, "LSTM cN", cL, wantCL)
+}
+
+// Gradients must flow through the bidirectional packed forward into every
+// parameter (both directions, all layers) and back to the padded input —
+// with exactly zero gradient at padded input positions, since no unmasked
+// output and no gathered state ever reads them.
+func TestForwardPackedBidirGradFlow(t *testing.T) {
+	x := seededRandn(787, 2, 3, 2).SetRequiresGrad(true)
+	ps := PackPaddedSequence(x, []int{3, 2}, true)
+
+	l := NewLSTM(2, 3, WithLayers(2), WithBidirectional())
+	outPS, hN, cN := l.ForwardPacked(ps)
+	outPS.Padded.Sum().Add(hN.Sum()).Add(cN.Sum()).Backward()
+	if x.Grad == nil {
+		t.Fatal("packed input received no gradient")
+	}
+	for i, p := range l.Parameters() {
+		if p.Grad == nil {
+			t.Fatalf("parameter %d received no gradient", i)
+		}
+		nonzero := false
+		for _, v := range p.Grad.Data {
+			if v != 0 {
+				nonzero = true
+				break
+			}
+		}
+		if !nonzero {
+			t.Fatalf("parameter %d has an all-zero gradient", i)
+		}
+	}
+	// The valid final step of sequence 0 gets gradient...
+	nonzero := false
+	for j := 0; j < 2; j++ {
+		if x.Grad.Data[(0*3+2)*2+j] != 0 {
+			nonzero = true
+		}
+	}
+	if !nonzero {
+		t.Fatal("valid final step of sequence 0 received no gradient")
+	}
+	// ...and the padded step of sequence 1 (t=2 >= length 2) gets exactly zero.
+	for j := 0; j < 2; j++ {
+		if g := x.Grad.Data[(1*3+2)*2+j]; g != 0 {
+			t.Fatalf("padded step received nonzero gradient %g", g)
+		}
+	}
 }
